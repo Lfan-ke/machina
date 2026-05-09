@@ -101,7 +101,12 @@ fn handle_connection(
         if cmd == "qmp_capabilities" {
             caps_done = true;
         }
-        if cmd == "quit" {
+        // Both quit and its QMP alias system_powerdown must end the
+        // connection loop. Without this the dispatch arm flips
+        // quit_requested but reader.lines() keeps blocking, so a
+        // peer that holds the socket open after system_powerdown
+        // leaves the monitor thread parked indefinitely.
+        if cmd == "quit" || cmd == "system_powerdown" {
             return true;
         }
     }
@@ -127,6 +132,12 @@ pub fn dispatch(cmd: &str, svc: &Arc<Mutex<MonitorService>>) -> Value {
             json!({"return": {}})
         }
         "quit" => {
+            s.quit();
+            json!({"return": {}})
+        }
+        "system_powerdown" => {
+            // QMP-compatible alias for quit: request shutdown so the
+            // emulator exits cleanly.
             s.quit();
             json!({"return": {}})
         }

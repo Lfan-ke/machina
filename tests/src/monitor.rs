@@ -137,6 +137,61 @@ fn test_mmp_quit() {
     assert!(svc.lock().unwrap().state.is_quit_requested());
 }
 
+#[test]
+fn test_mmp_system_powerdown() {
+    let svc = make_svc();
+    let resp = mmp::dispatch("system_powerdown", &svc);
+    assert_eq!(resp["return"], serde_json::json!({}));
+    assert!(
+        svc.lock().unwrap().state.is_quit_requested(),
+        "system_powerdown must request shutdown",
+    );
+}
+
+#[test]
+fn test_tcp_system_powerdown_terminates_connection_loop() {
+    // Regression: codex flagged that system_powerdown was an alias
+    // of quit at dispatch level but handle_connection only exited
+    // when cmd == "quit", so a peer could send system_powerdown,
+    // get success, and leave the monitor thread parked in
+    // reader.lines(). The fix makes both commands end the loop;
+    // this test asserts the spawned run_tcp thread joins cleanly
+    // after a single system_powerdown round-trip.
+    if !tcp_bind_available() {
+        eprintln!("skipping: TCP bind not permitted");
+        return;
+    }
+    let state = Arc::new(MonitorState::new());
+    let svc = Arc::new(Mutex::new(MonitorService::new(Arc::clone(&state))));
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let svc2 = Arc::clone(&svc);
+    let handle = std::thread::spawn(move || mmp::run_tcp(listener, svc2));
+
+    let stream = TcpStream::connect(addr).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+        .unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut writer = stream;
+
+    let _greeting = read_json_line(&mut reader);
+    send_cmd(&mut writer, "qmp_capabilities");
+    let _ = read_json_line(&mut reader);
+
+    send_cmd(&mut writer, "system_powerdown");
+    let resp = read_json_line(&mut reader);
+    assert!(
+        resp["return"].is_object(),
+        "system_powerdown should ack with empty return: {resp}",
+    );
+
+    // The server thread must terminate without us sending quit.
+    handle.join().unwrap();
+    assert!(state.is_quit_requested());
+}
+
 // ── HMP tests ───────────────────────────────────────
 
 #[test]
