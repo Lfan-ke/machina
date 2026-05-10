@@ -871,6 +871,56 @@ cargo test -- --test-threads=1    # Sequential (debugging)
 cargo test -- --test-threads=4    # 4 threads
 ```
 
+#### Pick the Narrowest Filter for Your Change
+
+While iterating, prefer a topic-scoped filter over the full
+`make test`. `cargo test` accepts only a single positional
+`TESTNAME` substring, so each row below gives one filter that
+selects everything under it via substring match (e.g. `cli_` or
+`riscv_` matches every module starting with that prefix). Where
+a topic genuinely needs more than one prefix, list each as a
+separate row so every row can be copy-pasted as-is into
+`cargo test -p machina-tests <filter>`.
+
+| Change area | Filter | Notes |
+|-------------|--------|-------|
+| CLI argument parsing (`-kernel`, `-bios`, `-drive`, `-netdev`, `-initrd`, `-m`, …) | `cli_` | Substring match for every `tests/src/cli_*` module; spawns the built binary, first run also rebuilds it. |
+| Disassembler (RV64 / Zb*, RVC) | `disas` | Pure logic, fast. |
+| Decoder DSL (`.decode` parser, codegen) | `decode` | Pure logic, fast. |
+| Memory regions, FlatView, AddressSpace | `memory_region` | Pure logic, fast. |
+| ELF / raw kernel loader | `hw_loader` | Builds in-memory ELFs. |
+| Hardware device models (PLIC, ACLINT, UART, GPIO, RTC, SD, SSI, IPI, …) | `hw_` | Substring match for every `tests/src/hw_*` module. |
+| RISC-V CPU semantics: CSR, MMU, PMP, exceptions | `riscv_` | Substring match for `riscv_csr` / `riscv_mmu` / `riscv_pmp` / `riscv_exception` / `riscv_thead_csr` / `riscv_cpu_model`. Run a more specific prefix (e.g. `riscv_csr`) to narrow further. |
+| RISC-V frontend (instruction decode + IR emit) | `frontend` | RV64I/M/F/C coverage. |
+| x86-64 backend (instruction encoding) | `backend` | x86-64 emitter coverage. Pair with `frontend` in separate runs. |
+| LoongArch guest support (decode, exec, board) | `loongarch_` | Substring match for every `loongarch_*` module. |
+| VirtIO transport / block / net | `virtio` | `virtio_net` cases need a unix host; CI runs them on Linux. |
+| Monitor (HMP, MMP/QMP, snapshot, TCP) | `monitor` | TCP cases bind `127.0.0.1:0`. |
+| GDB stub | `gdbstub` | Spawns the built binary; mind first-run latency. |
+| Boot tooling (irbackend, irdump, smoke) | `tools` | Spawns the built binary. |
+| RISC-V difftest vs. user-mode QEMU | `difftest` | Substring match for the `difftest_*` cases in `frontend::difftest`. Needs `qemu-riscv64` (user-mode) on PATH, not `qemu-system-riscv64`. |
+| LoongArch difftest vs. user-mode QEMU | `loongarch_difftest` | Needs `qemu-loongarch64` (user-mode) on PATH. |
+| Trace facility | `trace` | Pure logic, fast. |
+| Softfloat (IEEE 754) | `softfloat` | Pure logic, fast. |
+| Software MMU | `softmmu` | Substring match for `softmmu` and `softmmu_exec`. |
+| Multi-threaded vCPU regression | `exec::multi_vcpu` | The MTTCG / multi-vCPU exec tests; long-running, pass `-- --nocapture` if iterating. |
+| Source-tree hygiene (no `eprintln!`, etc.) | `source_cleanliness` | Cheap pre-PR check. |
+| Hardware oracle (live device-vs-spec) | `oracle` | Some cases compare against external reference values; flaky under heavy parallel load — re-run with `--test-threads=1` if a spurious failure appears. |
+
+Test counts (top-level modules listed by `cargo test -p
+machina-tests -- --list`; figures drift as PRs land):
+
+```bash
+cargo test -p machina-tests -- --list \
+    | grep ': test$' \
+    | sed 's/::.*//' \
+    | sort | uniq -c | sort -rn
+```
+
+Use the snippet above to recount before quoting numbers in a PR
+or doc; always cite the date you ran it on so the snapshot is
+clearly time-stamped rather than presented as authoritative.
+
 #### Code Quality Checks
 
 ```bash
@@ -883,7 +933,7 @@ cargo fmt                          # Auto-format
 
 ```bash
 # Multi-threaded vCPU concurrency regression
-cargo test -p machina-tests exec::mttcg -- --nocapture
+cargo test -p machina-tests exec::multi_vcpu -- --nocapture
 
 # Print execution statistics
 # (TB hit rate, chain patches, hint hits)
