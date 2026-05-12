@@ -167,6 +167,37 @@ impl Chardev for NullChardev {
     }
 }
 
+/// Writes output to host stdout and never produces input.
+pub struct StdoutChardev;
+
+impl StdoutChardev {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Chardev for StdoutChardev {
+    fn read(&mut self) -> Option<u8> {
+        None
+    }
+
+    fn write(&mut self, data: u8) {
+        let mut stdout = std::io::stdout().lock();
+        let _ = stdout.write_all(&[data]);
+        let _ = stdout.flush();
+    }
+
+    fn can_read(&self) -> bool {
+        false
+    }
+}
+
+impl Default for StdoutChardev {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Wraps host stdin/stdout with terminal escape
 /// sequences (Ctrl+A prefix):
 ///   Ctrl+A, X — exit emulator

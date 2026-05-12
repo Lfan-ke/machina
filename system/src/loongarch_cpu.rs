@@ -50,6 +50,7 @@ pub fn loongarch_soft_mmu_config() -> SoftMmuConfig {
 pub struct LoongArchFullSystemCpu {
     pub cpu: LoongArchCpu,
     stop_flag: Arc<AtomicBool>,
+    run_gate: Option<Arc<AtomicBool>>,
     interrupts: Option<Arc<LoongArchCpuInterruptState>>,
 }
 
@@ -76,6 +77,7 @@ impl LoongArchFullSystemCpu {
         Self {
             cpu,
             stop_flag,
+            run_gate: None,
             interrupts: None,
         }
     }
@@ -101,8 +103,19 @@ impl LoongArchFullSystemCpu {
         Self {
             cpu,
             stop_flag,
+            run_gate: None,
             interrupts: Some(interrupts),
         }
+    }
+
+    pub fn set_run_gate(&mut self, run_gate: Option<Arc<AtomicBool>>) {
+        self.run_gate = run_gate;
+    }
+
+    fn run_gate_open(&self) -> bool {
+        self.run_gate
+            .as_ref()
+            .is_none_or(|gate| gate.load(Ordering::Acquire))
     }
 
     fn apply_async_interrupts(&mut self) {
@@ -127,6 +140,11 @@ impl LoongArchFullSystemCpu {
         if let Some(interrupts) = &self.interrupts {
             interrupts.wake_waiters();
         }
+    }
+
+    #[must_use]
+    pub fn interrupt_state(&self) -> Option<Arc<LoongArchCpuInterruptState>> {
+        self.interrupts.as_ref().map(Arc::clone)
     }
 
     fn handle_wfi(&mut self) -> ArchExitAction {
@@ -253,12 +271,13 @@ impl GuestCpu for LoongArchFullSystemCpu {
     }
 
     fn should_exit(&self) -> bool {
-        !self.stop_flag.load(Ordering::Relaxed)
+        !self.stop_flag.load(Ordering::Relaxed) || !self.run_gate_open()
     }
 
     fn wait_for_interrupt(&self) -> bool {
         self.interrupts.as_ref().is_some_and(|interrupts| {
-            interrupts.wait_for_irq_or_stop(&self.stop_flag)
+            interrupts
+                .wait_for_irq_or_stop(&self.stop_flag, self.run_gate.as_deref())
         })
     }
 
@@ -396,19 +415,46 @@ fn translate_for_helper(
     cpu: &mut LoongArchCpu,
     gva: u64,
     access: mmu::AccessType,
+    size: u32,
 ) -> Option<u64> {
-    match cpu.translate_address_and_cache(gva, access) {
-        mmu::TlbLookupResult::Hit { pa, .. } => Some(pa),
-        fault => {
-            let fault_pc = cpu.fault_pc_val();
-            let vector = cpu.enter_address_translation_exception(
-                gva, access, fault, fault_pc,
-            );
+    let fault_pc = cpu.fault_pc_val();
+    let pa = match cpu.translate_address_or_exception(gva, access, fault_pc) {
+        Ok(pa) => pa,
+        Err(vector) => {
             cpu.set_pc(vector);
             cpu.set_memory_fault_pending(fault_pc);
-            None
+            return None;
+        }
+    };
+
+    let addend = helper_fast_tlb_addend(cpu, gva, pa, size);
+    cpu.fill_fast_tlb_for_translation(gva, access, pa, addend);
+    Some(pa)
+}
+
+fn helper_fast_tlb_addend(
+    cpu: &LoongArchCpu,
+    gva: u64,
+    pa: u64,
+    size: u32,
+) -> usize {
+    if let Some(as_) = unsafe { address_space_for(cpu) } {
+        if as_.is_mapped(GPA::new(pa), size) {
+            return mmu::FAST_TLB_MMIO_ADDEND;
         }
     }
+    if pa >= cpu.ram_base_val()
+        && pa
+            .checked_add(u64::from(size))
+            .is_some_and(|end| end <= cpu.ram_end_val())
+    {
+        return cpu
+            .guest_base_val()
+            .wrapping_add(pa & mmu::FAST_TLB_PAGE_MASK)
+            .wrapping_sub(gva & mmu::FAST_TLB_PAGE_MASK)
+            as usize;
+    }
+    mmu::FAST_TLB_MMIO_ADDEND
 }
 
 unsafe fn read_phys_sized(cpu: *const LoongArchCpu, pa: u64, size: u32) -> u64 {
@@ -527,7 +573,8 @@ pub unsafe extern "sysv64" fn loongarch_mem_read(
     size: u32,
 ) -> u64 {
     let cpu = &mut *(env as *mut LoongArchCpu);
-    let Some(pa) = translate_for_helper(cpu, gva, mmu::AccessType::Load) else {
+    let Some(pa) = translate_for_helper(cpu, gva, mmu::AccessType::Load, size)
+    else {
         return 0;
     };
     let Some((first_len, second_gva, second_len)) =
@@ -535,9 +582,12 @@ pub unsafe extern "sysv64" fn loongarch_mem_read(
     else {
         return read_phys_sized(cpu, pa, size);
     };
-    let Some(second_pa) =
-        translate_for_helper(cpu, second_gva, mmu::AccessType::Load)
-    else {
+    let Some(second_pa) = translate_for_helper(
+        cpu,
+        second_gva,
+        mmu::AccessType::Load,
+        second_len,
+    ) else {
         return 0;
     };
 
@@ -555,7 +605,7 @@ pub unsafe extern "sysv64" fn loongarch_mem_write(
     size: u32,
 ) {
     let cpu = &mut *(env as *mut LoongArchCpu);
-    let Some(pa) = translate_for_helper(cpu, gva, mmu::AccessType::Store)
+    let Some(pa) = translate_for_helper(cpu, gva, mmu::AccessType::Store, size)
     else {
         return;
     };
@@ -565,9 +615,12 @@ pub unsafe extern "sysv64" fn loongarch_mem_write(
         write_phys_sized(cpu, pa, val, size);
         return;
     };
-    let Some(second_pa) =
-        translate_for_helper(cpu, second_gva, mmu::AccessType::Store)
-    else {
+    let Some(second_pa) = translate_for_helper(
+        cpu,
+        second_gva,
+        mmu::AccessType::Store,
+        second_len,
+    ) else {
         return;
     };
 

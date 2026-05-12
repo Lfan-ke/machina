@@ -19,6 +19,8 @@ mod cli_netdev;
 #[cfg(test)]
 mod cli_ram;
 #[cfg(test)]
+mod cli_smp;
+#[cfg(test)]
 mod core;
 #[cfg(test)]
 mod core_address;

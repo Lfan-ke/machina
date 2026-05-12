@@ -10,6 +10,7 @@ pub use builtin::FirmwareCallFn;
 pub use cpus::FullSystemCpu;
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::Arc;
 
 use machina_accel::exec::exec_loop::{cpu_exec_loop, ExitReason};
@@ -129,10 +130,22 @@ impl CpuManager {
     /// to its RiscvCpu struct matching translation globals.
     pub unsafe fn run<B>(&mut self, shared: &SharedState<B>) -> ExitReason
     where
-        B: HostCodeGen,
+        B: HostCodeGen + Send + Sync,
     {
         if self.cpus.is_empty() {
             return ExitReason::Exit(0);
+        }
+        if self.cpus.len() > 1
+            && self
+                .cpus
+                .iter()
+                .all(|cpu| matches!(cpu, ManagedCpu::LoongArch(_)))
+        {
+            return Self::run_loongarch_cpus(
+                shared,
+                &self.running,
+                &mut self.cpus,
+            );
         }
         let running = Arc::clone(&self.running);
         let firmware_handler = self.firmware_handler.clone();
@@ -145,7 +158,7 @@ impl CpuManager {
                 cpu.as_mut(),
             ),
             ManagedCpu::LoongArch(cpu) => {
-                Self::run_loongarch_cpu(shared, &running, cpu)
+                Self::run_loongarch_cpu(shared, &running, cpu, true)
             }
         }
     }
@@ -209,6 +222,7 @@ impl CpuManager {
         shared: &SharedState<B>,
         running: &Arc<AtomicBool>,
         cpu: &mut LoongArchFullSystemCpu,
+        recover_buffer_full: bool,
     ) -> ExitReason
     where
         B: HostCodeGen,
@@ -221,6 +235,9 @@ impl CpuManager {
             }
             match r {
                 ExitReason::BufferFull => {
+                    if !recover_buffer_full {
+                        return ExitReason::BufferFull;
+                    }
                     let _guard = shared.translate_lock.lock().unwrap();
                     shared
                         .tb_store
@@ -232,6 +249,84 @@ impl CpuManager {
                 other => return other,
             }
         }
+    }
+
+    unsafe fn run_loongarch_cpus<B>(
+        shared: &SharedState<B>,
+        running: &Arc<AtomicBool>,
+        cpus: &mut [ManagedCpu],
+    ) -> ExitReason
+    where
+        B: HostCodeGen + Sync,
+    {
+        let wake_states: Vec<_> = cpus
+            .iter()
+            .filter_map(|cpu| match cpu {
+                ManagedCpu::LoongArch(cpu) => cpu.interrupt_state(),
+                ManagedCpu::Riscv(_) => None,
+            })
+            .collect();
+        let run_gate = Arc::new(AtomicBool::new(true));
+
+        for cpu in cpus.iter_mut() {
+            if let ManagedCpu::LoongArch(cpu) = cpu {
+                cpu.set_run_gate(Some(Arc::clone(&run_gate)));
+            }
+        }
+
+        let exit = loop {
+            run_gate.store(true, Ordering::SeqCst);
+            let (tx, rx) = mpsc::channel();
+            let exit = std::thread::scope(|scope| {
+                for (idx, cpu) in cpus.iter_mut().enumerate() {
+                    let ManagedCpu::LoongArch(cpu) = cpu else {
+                        continue;
+                    };
+                    let tx = tx.clone();
+                    let running = Arc::clone(running);
+                    scope.spawn(move || {
+                        let exit = unsafe {
+                            Self::run_loongarch_cpu(
+                                shared, &running, cpu, false,
+                            )
+                        };
+                        let _ = tx.send((idx, exit));
+                    });
+                }
+                drop(tx);
+
+                let (_, exit) = rx.recv().unwrap_or((0, ExitReason::Halted));
+                run_gate.store(false, Ordering::SeqCst);
+                for interrupts in &wake_states {
+                    interrupts.wake_waiters();
+                }
+                exit
+            });
+
+            if !matches!(exit, ExitReason::BufferFull) {
+                break exit;
+            }
+            if !running.load(Ordering::SeqCst) {
+                break ExitReason::Halted;
+            }
+
+            // All scoped vCPU threads have joined here, so no thread is
+            // executing or looking up TBs while the store is cleared.
+            let _guard = shared.translate_lock.lock().unwrap();
+            shared
+                .tb_store
+                .invalidate_all(shared.code_buf(), &shared.backend);
+            shared.tb_store.flush();
+            shared.code_buf_mut().set_offset(shared.code_gen_start);
+        };
+
+        for cpu in cpus.iter_mut() {
+            if let ManagedCpu::LoongArch(cpu) = cpu {
+                cpu.set_run_gate(None);
+            }
+        }
+
+        exit
     }
 }
 

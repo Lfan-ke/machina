@@ -1,5 +1,5 @@
 use machina_accel::code_buffer::CodeBuffer;
-use machina_accel::ir::tb::{EXCP_LOONGARCH_DONE, EXCP_UNDEF};
+use machina_accel::ir::tb::{EXCP_LOONGARCH_DONE, EXCP_UNDEF, TB_EXIT_IDX1};
 use machina_accel::ir::Context;
 use machina_accel::translate::translate_and_execute;
 use machina_accel::{HostCodeGen, X86_64CodeGen};
@@ -41,6 +41,8 @@ const OP_REVH_2W: u32 = 0b0000000000000000010000;
 const OP_REVH_D: u32 = 0b0000000000000000010001;
 const OP_DBAR: u32 = 0b00111000011100100;
 const OP_IBAR: u32 = 0b00111000011100101;
+const OP_BEQZ: u32 = 0b010000;
+const OP_BNEZ: u32 = 0b010001;
 const ERTN_INSN: u32 = 0x0648_3800;
 
 fn r3(op: u32, rk: u32, rj: u32, rd: u32) -> u32 {
@@ -57,6 +59,14 @@ fn r2_si12(op: u32, si12: i16, rj: u32, rd: u32) -> u32 {
 
 fn r2_si14(op: u32, si14: i16, rj: u32, rd: u32) -> u32 {
     (op << 24) | ((si14 as u16 as u32 & 0x3FFF) << 10) | (rj << 5) | rd
+}
+
+fn r1_offs21(op: u32, offs21: i32, rj: u32) -> u32 {
+    let imm = offs21 as u32 & 0x001F_FFFF;
+    (op << 26)
+        | (((imm >> 16) & 0x1F) << 0)
+        | ((imm & 0xFFFF) << 10)
+        | (rj << 5)
 }
 
 fn code15(op: u32, code: u32) -> u32 {
@@ -173,6 +183,46 @@ fn loongarch_sc_fails_without_or_after_lost_reservation() {
     assert_eq!(cpu.read_gpr(5), 0);
     assert_eq!(cpu.read_gpr(6), 0);
     assert_eq!(read_u32(&mem, 8), 0xBBBB_BBBB);
+}
+
+#[test]
+fn loongarch_sc_status_is_visible_to_following_branch() {
+    let mut mem = [0u8; 64];
+    mem[8..16].copy_from_slice(&0x1122_3344_5566_7788u64.to_le_bytes());
+
+    let mut cpu = LoongArchCpu::new();
+    cpu.set_guest_base(mem.as_mut_ptr() as u64);
+    cpu.set_ram_base(0);
+    cpu.set_ram_end(mem.len() as u64);
+    cpu.write_gpr(2, 0);
+
+    let success_insns = [
+        r2_si14(OP_LL_D, 2, 2, 5),
+        r2_si12(OP_ADDI_D, 0, 0, 5),
+        r2_si14(OP_SC_D, 2, 2, 5),
+        r1_offs21(OP_BEQZ, 1, 5),
+    ];
+
+    assert_eq!(run_la(&mut cpu, &success_insns), TB_EXIT_IDX1 as usize);
+    assert_eq!(cpu.read_gpr(5), 1);
+    assert_eq!(read_u64(&mem, 8), 0);
+
+    mem[8..12].copy_from_slice(&0xAAAA_AAAAu32.to_le_bytes());
+    cpu.write_gpr(5, 0);
+    cpu.write_gpr(8, 0);
+
+    let failure_insns = [
+        r2_si14(OP_LL_W, 2, 2, 5),
+        r2_si12(OP_ADDI_D, 0x33, 0, 8),
+        r2_si12(OP_ST_W, 8, 2, 8),
+        r2_si12(OP_ADDI_D, 7, 0, 5),
+        r2_si14(OP_SC_W, 2, 2, 5),
+        r1_offs21(OP_BNEZ, 1, 5),
+    ];
+
+    assert_eq!(run_la(&mut cpu, &failure_insns), TB_EXIT_IDX1 as usize);
+    assert_eq!(cpu.read_gpr(5), 0);
+    assert_eq!(read_u32(&mem, 8), 0x33);
 }
 
 #[test]

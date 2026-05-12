@@ -6,9 +6,14 @@
 )]
 
 use super::super::cpu::LoongArchCpu;
-use super::super::csr::{CRMD_DA, CRMD_PG, CRMD_PLV_MASK};
-use super::super::exception::{ECODE_BCE, ECODE_FPD, ECODE_INE, ECODE_IPE};
-use super::super::mmu::{AccessType, TlbLookupResult};
+use super::super::csr::{
+    valid_gcsr, CRMD_DA, CRMD_PG, CRMD_PLV_MASK, CSR_CRMD, CSR_ERA, CSR_PRMD,
+    CSR_TLBRERA, CSR_TLBRPRMD, GSTAT_PVM,
+};
+use super::super::exception::{
+    ECODE_BCE, ECODE_FPD, ECODE_GSPR, ECODE_INE, ECODE_IPE,
+};
+use super::super::mmu::AccessType;
 use machina_softfloat::{ExcFlags, Float32, Float64, FloatEnv, RoundMode};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -30,20 +35,19 @@ fn clear_ll_sc_reservation(cpu: &mut LoongArchCpu) {
     cpu.ll_res_val = 0;
 }
 
-fn enter_store_translation_fault(
+fn translate_store_for_helper(
     cpu: &mut LoongArchCpu,
     addr: u64,
-    fault: TlbLookupResult,
-) -> u64 {
+) -> Result<u64, ()> {
     let fault_pc = cpu.fault_pc_val();
-    let vector = cpu.enter_address_translation_exception(
-        addr,
-        AccessType::Store,
-        fault,
-        fault_pc,
-    );
-    cpu.set_pc(vector);
-    1
+    match cpu.translate_address_or_exception(addr, AccessType::Store, fault_pc)
+    {
+        Ok(pa) => Ok(pa),
+        Err(vector) => {
+            cpu.set_pc(vector);
+            Err(())
+        }
+    }
 }
 
 /// # Safety
@@ -2615,11 +2619,7 @@ pub unsafe extern "sysv64" fn loongarch_helper_cpucfg(
 #[no_mangle]
 pub unsafe extern "sysv64" fn loongarch_helper_tlbsrch(env: *mut u8) -> u64 {
     let cpu = &mut *(env.cast::<super::super::cpu::LoongArchCpu>());
-    if let Some(idx) = cpu.tlb_search() {
-        cpu.tlbidx = (cpu.tlbidx & !(0xFFF | (1 << 31))) | (idx as u64);
-    } else {
-        cpu.tlbidx |= 1 << 31;
-    }
+    cpu.tlb_search_and_update();
     0
 }
 
@@ -2707,10 +2707,12 @@ pub unsafe extern "sysv64" fn loongarch_helper_invtlb(
     va: u64,
 ) -> u64 {
     let cpu = &mut *(env.cast::<LoongArchCpu>());
-    if op > 6 {
+    let op = op as u32;
+    let lvz_op = matches!(op, 0x9..=0xE | 0x10..=0x16);
+    if op > 6 && !(cpu.cfg.has_lvz && lvz_op) {
         return enter_exception(cpu, u64::from(ECODE_INE), 0, None);
     }
-    cpu.invtlb(op as u32, asid_val as u16, va);
+    cpu.invtlb(op, asid_val as u16, va);
     0
 }
 
@@ -2722,10 +2724,46 @@ pub unsafe extern "sysv64" fn loongarch_helper_invtlb(
 #[no_mangle]
 pub unsafe extern "sysv64" fn loongarch_helper_check_plv(env: *mut u8) -> u64 {
     let cpu = &mut *(env.cast::<LoongArchCpu>());
-    if cpu.crmd & CRMD_PLV_MASK != CRMD_PLV_MASK {
+    let crmd = if cpu.in_guest_mode() {
+        cpu.gcsr_read(CSR_CRMD)
+    } else {
+        cpu.crmd
+    };
+    if crmd & CRMD_PLV_MASK != CRMD_PLV_MASK {
         return 0;
     }
     enter_exception(cpu, u64::from(ECODE_IPE), 0, None)
+}
+
+/// Returns 0 unless guest mode needs a sensitive-resource trap.
+///
+/// # Safety
+/// `env` must point to a valid `LoongArchCpu`.
+#[no_mangle]
+pub unsafe extern "sysv64" fn loongarch_helper_check_guest_sensitive(
+    env: *mut u8,
+) -> u64 {
+    let cpu = &mut *(env.cast::<LoongArchCpu>());
+    if !cpu.in_guest_mode() {
+        return 0;
+    }
+    enter_exception(cpu, u64::from(ECODE_GSPR), 0, None)
+}
+
+/// Returns 0 unless guest mode tries to access an invalid GCSR number.
+///
+/// # Safety
+/// `env` must point to a valid `LoongArchCpu`.
+#[no_mangle]
+pub unsafe extern "sysv64" fn loongarch_helper_check_guest_csr(
+    env: *mut u8,
+    csr_num: u64,
+) -> u64 {
+    let cpu = &mut *(env.cast::<LoongArchCpu>());
+    if !cpu.in_guest_mode() || valid_gcsr(csr_num as u32) {
+        return 0;
+    }
+    enter_exception(cpu, u64::from(ECODE_GSPR), 0, None)
 }
 
 /// # Safety
@@ -2758,7 +2796,24 @@ pub unsafe extern "sysv64" fn loongarch_helper_raise_exception_with_badv(
 #[no_mangle]
 pub unsafe extern "sysv64" fn loongarch_helper_ertn(env: *mut u8) -> u64 {
     let cpu = &mut *(env.cast::<LoongArchCpu>());
-    let pc = if cpu.tlbrera & 1 != 0 {
+    let pc = if cpu.in_guest_mode() {
+        let gtlbrera = cpu.gcsr_read(CSR_TLBRERA);
+        if gtlbrera & 1 != 0 {
+            let pplv_pie = cpu.gcsr_read(CSR_TLBRPRMD) & 0x7;
+            let gcrmd = cpu.gcsr_read(CSR_CRMD);
+            cpu.gcsr_write(
+                CSR_CRMD,
+                (gcrmd & !0x7 & !CRMD_DA & !CRMD_PG) | pplv_pie | CRMD_PG,
+            );
+            cpu.gcsr_write(CSR_TLBRERA, gtlbrera & !1);
+            gtlbrera & !0x3
+        } else {
+            let gcrmd = cpu.gcsr_read(CSR_CRMD);
+            let gprmd = cpu.gcsr_read(CSR_PRMD);
+            cpu.gcsr_write(CSR_CRMD, (gcrmd & !0x7) | (gprmd & 0x7));
+            cpu.gcsr_read(CSR_ERA)
+        }
+    } else if cpu.tlbrera & 1 != 0 {
         // Return from TLB refill: restore PLV/IE, clear DA, set PG
         let pplv_pie = cpu.tlbrprmd & 0x7;
         cpu.set_crmd(
@@ -2769,6 +2824,9 @@ pub unsafe extern "sysv64" fn loongarch_helper_ertn(env: *mut u8) -> u64 {
         pc
     } else {
         cpu.set_crmd((cpu.crmd & !0x7) | (cpu.prmd & 0x7));
+        if cpu.gstat & GSTAT_PVM != 0 {
+            cpu.enter_guest_mode();
+        }
         cpu.era
     };
     clear_ll_sc_reservation(cpu);
@@ -2801,7 +2859,11 @@ pub unsafe extern "sysv64" fn loongarch_helper_csrrd(
     csr_num: u64,
 ) -> u64 {
     let cpu = &*(env.cast::<super::super::cpu::LoongArchCpu>());
-    cpu.csr_read(csr_num as u32)
+    if cpu.in_guest_mode() {
+        cpu.gcsr_read(csr_num as u32)
+    } else {
+        cpu.csr_read(csr_num as u32)
+    }
 }
 
 /// # Safety
@@ -2813,9 +2875,15 @@ pub unsafe extern "sysv64" fn loongarch_helper_csrwr(
     val: u64,
 ) -> u64 {
     let cpu = &mut *(env.cast::<super::super::cpu::LoongArchCpu>());
-    let old = cpu.csr_read(csr_num as u32);
-    cpu.csr_write(csr_num as u32, val);
-    old
+    if cpu.in_guest_mode() {
+        let old = cpu.gcsr_read(csr_num as u32);
+        cpu.gcsr_write(csr_num as u32, val);
+        old
+    } else {
+        let old = cpu.csr_read(csr_num as u32);
+        cpu.csr_write(csr_num as u32, val);
+        old
+    }
 }
 
 /// # Safety
@@ -2828,7 +2896,49 @@ pub unsafe extern "sysv64" fn loongarch_helper_csrxchg(
     mask: u64,
 ) -> u64 {
     let cpu = &mut *(env.cast::<super::super::cpu::LoongArchCpu>());
-    cpu.csr_xchg(csr_num as u32, val, mask)
+    if cpu.in_guest_mode() {
+        cpu.gcsr_xchg(csr_num as u32, val, mask)
+    } else {
+        cpu.csr_xchg(csr_num as u32, val, mask)
+    }
+}
+
+/// # Safety
+/// `env` must point to a valid `LoongArchCpu`.
+#[no_mangle]
+pub unsafe extern "sysv64" fn loongarch_helper_gcsrrd(
+    env: *mut u8,
+    csr_num: u64,
+) -> u64 {
+    let cpu = &*(env.cast::<super::super::cpu::LoongArchCpu>());
+    cpu.gcsr_read(csr_num as u32)
+}
+
+/// # Safety
+/// `env` must point to a valid `LoongArchCpu`.
+#[no_mangle]
+pub unsafe extern "sysv64" fn loongarch_helper_gcsrwr(
+    env: *mut u8,
+    csr_num: u64,
+    val: u64,
+) -> u64 {
+    let cpu = &mut *(env.cast::<super::super::cpu::LoongArchCpu>());
+    let old = cpu.gcsr_read(csr_num as u32);
+    cpu.gcsr_write(csr_num as u32, val);
+    old
+}
+
+/// # Safety
+/// `env` must point to a valid `LoongArchCpu`.
+#[no_mangle]
+pub unsafe extern "sysv64" fn loongarch_helper_gcsrxchg(
+    env: *mut u8,
+    csr_num: u64,
+    val: u64,
+    mask: u64,
+) -> u64 {
+    let cpu = &mut *(env.cast::<super::super::cpu::LoongArchCpu>());
+    cpu.gcsr_xchg(csr_num as u32, val, mask)
 }
 
 /// # Safety
@@ -2838,7 +2948,6 @@ pub unsafe extern "sysv64" fn loongarch_helper_sc_w(
     env: *mut u8,
     addr: u64,
     val: u64,
-    rd: u64,
 ) -> u64 {
     let cpu = &mut *(env.cast::<super::super::cpu::LoongArchCpu>());
     let llbit = cpu.llbctl;
@@ -2848,31 +2957,25 @@ pub unsafe extern "sysv64" fn loongarch_helper_sc_w(
     cpu.ll_res_addr = u64::MAX;
     cpu.ll_res_val = 0;
     if llbit == 0 || res_addr != addr {
-        cpu.write_gpr(rd as usize, 0);
         return 0;
     }
-    let pa = match cpu.translate_address(addr, AccessType::Store) {
-        TlbLookupResult::Hit { pa, .. } => pa,
-        fault => return enter_store_translation_fault(cpu, addr, fault),
+    let pa = match translate_store_for_helper(cpu, addr) {
+        Ok(pa) => pa,
+        Err(()) => return 2,
     };
     let end = match pa.checked_add(4) {
         Some(e) if pa >= cpu.ram_base && e <= cpu.ram_end => e,
-        _ => {
-            cpu.write_gpr(rd as usize, 0);
-            return 0;
-        }
+        _ => return 0,
     };
     let _ = end;
     let host_ptr = (cpu.guest_base as *const u8).add(pa as usize);
     let current = (host_ptr as *const u32).read_unaligned();
     if i64::from(current as i32) != res_val as i64 {
-        cpu.write_gpr(rd as usize, 0);
         return 0;
     }
     let host_wptr = (cpu.guest_base as *mut u8).add(pa as usize);
     (host_wptr as *mut u32).write_unaligned(val as u32);
-    cpu.write_gpr(rd as usize, 1);
-    0
+    1
 }
 
 /// # Safety
@@ -2882,7 +2985,6 @@ pub unsafe extern "sysv64" fn loongarch_helper_sc_d(
     env: *mut u8,
     addr: u64,
     val: u64,
-    rd: u64,
 ) -> u64 {
     let cpu = &mut *(env.cast::<super::super::cpu::LoongArchCpu>());
     let llbit = cpu.llbctl;
@@ -2892,29 +2994,23 @@ pub unsafe extern "sysv64" fn loongarch_helper_sc_d(
     cpu.ll_res_addr = u64::MAX;
     cpu.ll_res_val = 0;
     if llbit == 0 || res_addr != addr {
-        cpu.write_gpr(rd as usize, 0);
         return 0;
     }
-    let pa = match cpu.translate_address(addr, AccessType::Store) {
-        TlbLookupResult::Hit { pa, .. } => pa,
-        fault => return enter_store_translation_fault(cpu, addr, fault),
+    let pa = match translate_store_for_helper(cpu, addr) {
+        Ok(pa) => pa,
+        Err(()) => return 2,
     };
     let end = match pa.checked_add(8) {
         Some(e) if pa >= cpu.ram_base && e <= cpu.ram_end => e,
-        _ => {
-            cpu.write_gpr(rd as usize, 0);
-            return 0;
-        }
+        _ => return 0,
     };
     let _ = end;
     let host_ptr = (cpu.guest_base as *const u8).add(pa as usize);
     let current = (host_ptr as *const u64).read_unaligned();
     if current != res_val {
-        cpu.write_gpr(rd as usize, 0);
         return 0;
     }
     let host_wptr = (cpu.guest_base as *mut u8).add(pa as usize);
     (host_wptr as *mut u64).write_unaligned(val);
-    cpu.write_gpr(rd as usize, 1);
-    0
+    1
 }

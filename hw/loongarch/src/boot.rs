@@ -1,6 +1,8 @@
+use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use flate2::read::GzDecoder;
 use machina_core::address::GPA;
@@ -16,13 +18,16 @@ use crate::interrupt::{
 use crate::virt_machine::{
     VIRT_EIOINTC_BASE, VIRT_EIOINTC_SIZE, VIRT_FLASH0_BASE, VIRT_FLASH0_SIZE,
     VIRT_FLASH1_BASE, VIRT_FLASH1_SIZE, VIRT_FWCFG_BASE, VIRT_FWCFG_SIZE,
-    VIRT_IPI_BASE, VIRT_IPI_SIZE, VIRT_PCH_MSI_BASE, VIRT_PCH_MSI_SIZE,
-    VIRT_PCH_PIC_BASE, VIRT_PCH_PIC_SIZE, VIRT_RAM_BASE, VIRT_RTC_BASE,
-    VIRT_RTC_SIZE, VIRT_UART_BASE, VIRT_UART_SIZE, VIRT_VIRTIO_BASE,
-    VIRT_VIRTIO_SIZE,
+    VIRT_IPI_BASE, VIRT_IPI_SIZE, VIRT_LEGACY_IO_BASE, VIRT_LEGACY_IO_SIZE,
+    VIRT_LEGACY_IPI_BASE, VIRT_LEGACY_IPI_STRIDE, VIRT_PCH_MSI_BASE,
+    VIRT_PCH_MSI_SIZE, VIRT_PCH_PIC_BASE, VIRT_PCH_PIC_SIZE, VIRT_PCI_CFG_BASE,
+    VIRT_PCI_CFG_SIZE, VIRT_PCI_HT_CFG_BASE, VIRT_RAM_BASE, VIRT_RTC_BASE,
+    VIRT_RTC_SIZE, VIRT_UART1_BASE, VIRT_UART1_SIZE, VIRT_UART_BASE,
+    VIRT_UART_SIZE, VIRT_VIRTIO_BASE, VIRT_VIRTIO_SIZE,
 };
 
 pub const KERNEL_ENTRY_DEFAULT: u64 = 0x9000_0000_0020_0000;
+pub const SECONDARY_BOOT_ENTRY: u64 = VIRT_RAM_BASE + 0x1000;
 
 type BootResult<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -51,11 +56,47 @@ const EFI_MEMORY_DESC_VERSION: u32 = 1;
 const EFI_RESERVED_MEMORY: u32 = 0;
 const EFI_CONVENTIONAL_MEMORY: u32 = 7;
 const EFI_PAGE_SIZE: u64 = 4096;
+const BOOT_RNG_SEED_SIZE: usize = 32;
 const ELF64_EHDR_SIZE: usize = 64;
 const ELF64_PHDR_SIZE: usize = 56;
 const ET_EXEC: u16 = 2;
 const ET_DYN: u16 = 3;
 const PT_LOAD: u32 = 1;
+
+const SECONDARY_BOOT_CODE: [u32; 30] = [
+    0x0400_302c,
+    0x0380_100c,
+    0x0400_0180,
+    0x1400_002d,
+    0x0380_81ad,
+    0x0648_1da0,
+    0x1400_002c,
+    0x0400_118c,
+    0x02ff_fc0c,
+    0x1400_002d,
+    0x0380_11ad,
+    0x0648_19ac,
+    0x1400_002d,
+    0x0380_81ad,
+    0x0648_8000,
+    0x0340_0000,
+    0x0648_09ac,
+    0x43ff_f59f,
+    0x1400_002d,
+    0x0648_09ac,
+    0x1400_002d,
+    0x0380_31ad,
+    0x0648_19ac,
+    0x1400_002c,
+    0x0400_1180,
+    0x1400_002d,
+    0x0380_81ad,
+    0x0648_0dac,
+    0x0015_0181,
+    0x4c00_0020,
+];
+const SECONDARY_BOOT_CODE_SIZE: u64 =
+    (SECONDARY_BOOT_CODE.len() * std::mem::size_of::<u32>()) as u64;
 
 const DEVICE_TREE_GUID: [u8; 16] = [
     0xd5, 0x21, 0xb6, 0xb1, 0x9c, 0xf1, 0xa5, 0x41, 0x83, 0x0b, 0xd9, 0x15,
@@ -81,6 +122,7 @@ pub struct DirectKernelBoot {
 pub struct DirectKernelBootConfig<'a> {
     pub cmdline: Option<&'a str>,
     pub initrd_path: Option<&'a Path>,
+    pub cpu_count: u32,
     pub has_virtio_mmio: bool,
     pub fw_cfg: Option<Arc<FwCfg>>,
 }
@@ -207,6 +249,26 @@ fn normalize_ram_addr(
     })?;
     ensure_ram_range(addr, 1, ram_size, label)?;
     Ok(addr)
+}
+
+pub fn install_secondary_boot_code(
+    ram_size: u64,
+    address_space: &AddressSpace,
+) -> BootResult<u64> {
+    ensure_ram_range(
+        SECONDARY_BOOT_ENTRY,
+        SECONDARY_BOOT_CODE_SIZE,
+        ram_size,
+        "secondary boot",
+    )?;
+    for (index, insn) in SECONDARY_BOOT_CODE.iter().enumerate() {
+        address_space.write(
+            GPA::new(SECONDARY_BOOT_ENTRY + (index as u64 * 4)),
+            4,
+            u64::from(*insn),
+        );
+    }
+    Ok(SECONDARY_BOOT_ENTRY)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -439,6 +501,23 @@ fn boot_param_base(ram_size: u64) -> BootResult<u64> {
     Ok(ram_end(ram_size)? - BOOT_PARAM_WINDOW_SIZE)
 }
 
+fn secondary_boot_reserved_range(
+    ram_size: u64,
+    cpu_count: u32,
+) -> BootResult<Option<GuestRange>> {
+    if cpu_count <= 1 {
+        return Ok(None);
+    }
+
+    GuestRange::in_ram(
+        SECONDARY_BOOT_ENTRY,
+        EFI_PAGE_SIZE,
+        ram_size,
+        "secondary boot",
+    )
+    .map(Some)
+}
+
 fn push_le_u32(data: &mut [u8], offset: usize, val: u32) {
     data[offset..offset + 4].copy_from_slice(&val.to_le_bytes());
 }
@@ -458,35 +537,54 @@ fn align_down(value: u64, align: u64) -> u64 {
     value & !(align - 1)
 }
 
-fn align_up_low_page(value: u64) -> u64 {
-    value.saturating_add(EFI_PAGE_SIZE - 1) & !(EFI_PAGE_SIZE - 1)
+fn push_reserved_range(ranges: &mut Vec<(u64, u64)>, base: u64, size: u64) {
+    let start = align_down(base, EFI_PAGE_SIZE);
+    let end =
+        align_up(base.saturating_add(size), EFI_PAGE_SIZE).unwrap_or(u64::MAX);
+    if start < end {
+        ranges.push((start, end));
+    }
 }
 
-fn low_ram_reserved_ranges(ram_size: u64) -> Vec<(u64, u64)> {
-    let apertures = [
-        (VIRT_IPI_BASE, VIRT_IPI_SIZE),
-        (VIRT_EIOINTC_BASE, VIRT_EIOINTC_SIZE),
-        (VIRT_PCH_PIC_BASE, VIRT_PCH_PIC_SIZE),
-        (VIRT_PCH_MSI_BASE, VIRT_PCH_MSI_SIZE),
-        (VIRT_RTC_BASE, VIRT_RTC_SIZE),
-        (VIRT_FLASH0_BASE, VIRT_FLASH0_SIZE),
-        (VIRT_FLASH1_BASE, VIRT_FLASH1_SIZE),
-        (VIRT_VIRTIO_BASE, VIRT_VIRTIO_SIZE),
-        (VIRT_UART_BASE, VIRT_UART_SIZE),
-    ];
-    let mut ranges: Vec<(u64, u64)> = apertures
-        .into_iter()
-        .filter_map(|(base, size)| {
-            let start = align_down(base, EFI_PAGE_SIZE).min(ram_size);
-            let end =
-                align_up_low_page(base.saturating_add(size)).min(ram_size);
-            (start < end).then_some((start, end))
-        })
-        .collect();
-    ranges.sort_unstable_by_key(|(start, _)| *start);
+fn low_ram_reserved_ranges(ram_size: u64, cpu_count: u32) -> Vec<(u64, u64)> {
+    let ram_size = align_down(ram_size, EFI_PAGE_SIZE);
+    let mut ranges = Vec::new();
+    push_reserved_range(&mut ranges, VIRT_LEGACY_IO_BASE, VIRT_LEGACY_IO_SIZE);
+    push_reserved_range(&mut ranges, VIRT_IPI_BASE, VIRT_IPI_SIZE);
+    push_reserved_range(&mut ranges, VIRT_EIOINTC_BASE, VIRT_EIOINTC_SIZE);
+    push_reserved_range(&mut ranges, VIRT_PCH_PIC_BASE, VIRT_PCH_PIC_SIZE);
+    push_reserved_range(&mut ranges, VIRT_VIRTIO_BASE, VIRT_VIRTIO_SIZE);
+    push_reserved_range(&mut ranges, VIRT_UART1_BASE, VIRT_UART1_SIZE);
+    push_reserved_range(&mut ranges, VIRT_RTC_BASE, VIRT_RTC_SIZE);
+    push_reserved_range(&mut ranges, VIRT_PCH_MSI_BASE, VIRT_PCH_MSI_SIZE);
+    push_reserved_range(&mut ranges, VIRT_FLASH0_BASE, VIRT_FLASH0_SIZE);
+    push_reserved_range(&mut ranges, VIRT_FLASH1_BASE, VIRT_FLASH1_SIZE);
+    push_reserved_range(&mut ranges, VIRT_FWCFG_BASE, VIRT_FWCFG_SIZE);
+    push_reserved_range(&mut ranges, VIRT_UART_BASE, VIRT_UART_SIZE);
+    if cpu_count > 1 {
+        push_reserved_range(
+            &mut ranges,
+            boot_phys_addr(SECONDARY_BOOT_ENTRY),
+            SECONDARY_BOOT_CODE_SIZE,
+        );
+    }
+    if cpu_count > 0 {
+        push_reserved_range(
+            &mut ranges,
+            VIRT_LEGACY_IPI_BASE,
+            u64::from(cpu_count).saturating_mul(VIRT_LEGACY_IPI_STRIDE),
+        );
+    }
+    push_reserved_range(&mut ranges, VIRT_PCI_CFG_BASE, VIRT_PCI_CFG_SIZE);
+    push_reserved_range(&mut ranges, VIRT_PCI_HT_CFG_BASE, VIRT_PCI_CFG_SIZE);
 
+    ranges.sort_by_key(|(start, _)| *start);
     let mut merged: Vec<(u64, u64)> = Vec::new();
     for (start, end) in ranges {
+        if start >= ram_size {
+            break;
+        }
+        let end = end.min(ram_size);
         if let Some((_, last_end)) = merged.last_mut() {
             if start <= *last_end {
                 *last_end = (*last_end).max(end);
@@ -495,21 +593,24 @@ fn low_ram_reserved_ranges(ram_size: u64) -> Vec<(u64, u64)> {
         }
         merged.push((start, end));
     }
-
     merged
         .into_iter()
         .map(|(start, end)| (start, end - start))
         .collect()
 }
 
-fn low_ram_usable_ranges(ram_size: u64) -> Vec<(u64, u64)> {
+fn low_ram_usable_ranges(ram_size: u64, cpu_count: u32) -> Vec<(u64, u64)> {
+    let ram_size = align_down(ram_size, EFI_PAGE_SIZE);
+    if ram_size == 0 {
+        return Vec::new();
+    }
     let mut ranges = Vec::new();
     let mut cursor = 0;
-    for (hole_start, hole_size) in low_ram_reserved_ranges(ram_size) {
-        if cursor < hole_start {
-            ranges.push((cursor, hole_start - cursor));
+    for (base, size) in low_ram_reserved_ranges(ram_size, cpu_count) {
+        if cursor < base {
+            ranges.push((cursor, base - cursor));
         }
-        cursor = cursor.max(hole_start + hole_size);
+        cursor = cursor.max(base + size);
     }
     if cursor < ram_size {
         ranges.push((cursor, ram_size - cursor));
@@ -554,6 +655,10 @@ fn property_reg(fdt: &mut FdtBuilder, regions: &[(u64, u64)]) {
     fdt.property_bytes("reg", &make_reg_cells(regions));
 }
 
+fn isa_io_range_cells(base: u64, size: u32) -> [u32; 5] {
+    [1, 0, (base >> 32) as u32, (base & 0xffff_ffff) as u32, size]
+}
+
 fn property_string_list(fdt: &mut FdtBuilder, name: &str, values: &[&str]) {
     let mut data = Vec::new();
     for value in values {
@@ -563,9 +668,32 @@ fn property_string_list(fdt: &mut FdtBuilder, name: &str, values: &[&str]) {
     fdt.property_bytes(name, &data);
 }
 
+fn boot_rng_seed() -> [u8; BOOT_RNG_SEED_SIZE] {
+    let mut seed = [0u8; BOOT_RNG_SEED_SIZE];
+    if File::open("/dev/urandom")
+        .and_then(|mut file| file.read_exact(&mut seed))
+        .is_ok()
+    {
+        return seed;
+    }
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos() as u64);
+    let pid = u64::from(std::process::id());
+    for (idx, chunk) in seed.chunks_mut(8).enumerate() {
+        let value = now.rotate_left((idx * 13) as u32)
+            ^ pid.rotate_left((idx * 7) as u32)
+            ^ (idx as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        chunk.copy_from_slice(&value.to_le_bytes());
+    }
+    seed
+}
+
 fn build_fdt(
     cmdline: &str,
     ram_size: u64,
+    cpu_count: u32,
     initrd: Option<(u64, u64)>,
     has_virtio_mmio: bool,
 ) -> Vec<u8> {
@@ -580,6 +708,7 @@ fn build_fdt(
     fdt.property_u32("#size-cells", 2);
 
     fdt.begin_node("chosen");
+    fdt.property_bytes("rng-seed", &boot_rng_seed());
     fdt.property_string("bootargs", cmdline);
     fdt.property_string("stdout-path", &format!("/serial@{VIRT_UART_BASE:x}"));
     if let Some((start, size)) = initrd {
@@ -591,11 +720,13 @@ fn build_fdt(
     fdt.begin_node("cpus");
     fdt.property_u32("#address-cells", 1);
     fdt.property_u32("#size-cells", 0);
-    fdt.begin_node("cpu@0");
-    fdt.property_string("device_type", "cpu");
-    fdt.property_string("compatible", "loongarch,la464");
-    fdt.property_u32("reg", 0);
-    fdt.end_node();
+    for cpu_id in 0..cpu_count {
+        fdt.begin_node(&format!("cpu@{cpu_id}"));
+        fdt.property_string("device_type", "cpu");
+        fdt.property_string("compatible", "loongarch,la464");
+        fdt.property_u32("reg", cpu_id);
+        fdt.end_node();
+    }
     fdt.end_node();
 
     fdt.begin_node("cpuic");
@@ -607,7 +738,7 @@ fn build_fdt(
 
     fdt.begin_node("memory@0");
     fdt.property_string("device_type", "memory");
-    property_reg(&mut fdt, &low_ram_usable_ranges(ram_size));
+    property_reg(&mut fdt, &low_ram_usable_ranges(ram_size, cpu_count));
     fdt.end_node();
 
     fdt.begin_node(&format!("fw_cfg@{VIRT_FWCFG_BASE:x}"));
@@ -657,6 +788,16 @@ fn build_fdt(
     property_reg(&mut fdt, &[(VIRT_RTC_BASE, VIRT_RTC_SIZE)]);
     fdt.property_u32_list("interrupts", &[LOONGARCH_RTC_PCH_IRQ, 4]);
     fdt.property_u32("interrupt-parent", pch_pic_phandle);
+    fdt.end_node();
+
+    fdt.begin_node(&format!("isa@{VIRT_LEGACY_IO_BASE:x}"));
+    fdt.property_string("compatible", "isa");
+    fdt.property_u32("#address-cells", 2);
+    fdt.property_u32("#size-cells", 1);
+    fdt.property_u32_list(
+        "ranges",
+        &isa_io_range_cells(VIRT_LEGACY_IO_BASE, VIRT_LEGACY_IO_SIZE as u32),
+    );
     fdt.end_node();
 
     fdt.begin_node(&format!("flash@{VIRT_FLASH0_BASE:x}"));
@@ -711,12 +852,12 @@ fn append_config_table(entries: &mut Vec<u8>, guid: [u8; 16], table: u64) {
     entries.extend_from_slice(&table.to_le_bytes());
 }
 
-fn build_boot_memmap(ram_size: u64) -> Vec<u8> {
+fn build_boot_memmap(ram_size: u64, cpu_count: u32) -> Vec<u8> {
     let mut descriptors = Vec::new();
-    for (base, size) in low_ram_usable_ranges(ram_size) {
+    for (base, size) in low_ram_usable_ranges(ram_size, cpu_count) {
         descriptors.push((base, size, EFI_CONVENTIONAL_MEMORY));
     }
-    for (base, size) in low_ram_reserved_ranges(ram_size) {
+    for (base, size) in low_ram_reserved_ranges(ram_size, cpu_count) {
         descriptors.push((base, size, EFI_RESERVED_MEMORY));
     }
     descriptors.sort_unstable_by_key(|(base, _, _)| *base);
@@ -855,12 +996,24 @@ fn write_boot_parameters(
         .into());
     }
 
+    let mut initrd_reserved = kernel_ranges.to_vec();
+    if let Some(range) =
+        secondary_boot_reserved_range(ram_size, config.cpu_count)?
+    {
+        initrd_reserved.push(range);
+    }
     let initrd_plan =
-        plan_initrd(config.initrd_path, ram_size, base, kernel_ranges)?;
+        plan_initrd(config.initrd_path, ram_size, base, &initrd_reserved)?;
     let initrd = initrd_plan
         .as_ref()
         .map(|plan| (boot_phys_addr(plan.range.start), plan.len));
-    let fdt = build_fdt(cmdline, ram_size, initrd, config.has_virtio_mmio);
+    let fdt = build_fdt(
+        cmdline,
+        ram_size,
+        config.cpu_count,
+        initrd,
+        config.has_virtio_mmio,
+    );
     let fdt_limit = BOOT_SYSTEM_TABLE_OFFSET - BOOT_FDT_OFFSET;
     if fdt.len() as u64 > fdt_limit {
         return Err(format!(
@@ -870,7 +1023,7 @@ fn write_boot_parameters(
         .into());
     }
 
-    let memmap = build_boot_memmap(ram_size);
+    let memmap = build_boot_memmap(ram_size, config.cpu_count);
     let mut entries = Vec::new();
     append_config_table(&mut entries, LINUX_EFI_BOOT_MEMMAP_GUID, memmap_addr);
     if let Some(plan) = &initrd_plan {

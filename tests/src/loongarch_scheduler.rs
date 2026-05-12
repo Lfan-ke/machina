@@ -21,7 +21,8 @@ use machina_hw_loongarch::virt_machine::{
     VIRT_UART_BASE,
 };
 use machina_system::loongarch_cpu::{
-    loongarch_mem_write, loongarch_soft_mmu_config, LoongArchFullSystemCpu,
+    loongarch_mem_read, loongarch_mem_write, loongarch_soft_mmu_config,
+    LoongArchFullSystemCpu,
 };
 use machina_system::CpuManager;
 
@@ -277,6 +278,151 @@ fn task85_runtime_low_mmio_dispatches_before_low_ram_fast_path() {
     );
     assert_eq!(machine.ipi().mmio_read_sized(0, 0x004, 4), 0xa5a5_5a5a);
     assert_eq!(machine.eiointc().mmio_read_sized(0, 0x0200, 4), 0xf0);
+}
+
+#[test]
+fn task96_runtime_low_mmio_read_does_not_populate_ram_fast_tlb() {
+    let mut opts = default_opts();
+    opts.ram_size = 64 * 1024 * 1024;
+
+    let mut machine = LoongArchVirtMachine::new();
+    machine.init(&opts).unwrap();
+
+    let mut runtime_cpu = take_runtime_cpu(
+        &mut machine,
+        opts.ram_size,
+        Arc::new(AtomicBool::new(true)),
+    );
+    runtime_cpu.cpu.csr_write(CSR_CRMD, CRMD_DA);
+
+    let ipi_enable_pa = VIRT_IPI_BASE + 0x004;
+    let ram = machine.ram_block().as_ptr();
+    unsafe {
+        (ram.add(ipi_enable_pa as usize) as *mut u32)
+            .write_unaligned(0x1122_3344);
+        let _ = loongarch_mem_read(runtime_cpu.env_ptr(), ipi_enable_pa, 4);
+    }
+
+    assert_eq!(
+        runtime_cpu
+            .cpu
+            .fast_tlb_lookup_addend(ipi_enable_pa, AccessType::Load),
+        None,
+        "low MMIO must keep the JIT on the AddressSpace slow path"
+    );
+    assert_eq!(
+        unsafe {
+            (ram.add(ipi_enable_pa as usize) as *const u32).read_unaligned()
+        },
+        0x1122_3344
+    );
+}
+
+#[test]
+fn task97_cpu_manager_runs_secondary_loongarch_cpus() {
+    let mut opts = default_opts();
+    opts.cpu_count = 2;
+
+    let mut machine = LoongArchVirtMachine::new();
+    machine.init(&opts).unwrap();
+    machine.address_space().write(
+        GPA::new(VIRT_RAM_BASE),
+        4,
+        u64::from(code15_insn(IDLE_OP, 0)),
+    );
+
+    let mut manager = CpuManager::new();
+    let stop_flag = manager.running_flag();
+    let cpu_states = machine.take_runtime_cpu_states().unwrap();
+    assert_eq!(cpu_states.len(), 2);
+    let wake_secondary = Arc::clone(&cpu_states[1].1);
+
+    for (cpu_state, interrupts) in cpu_states {
+        let cpu = unsafe {
+            LoongArchFullSystemCpu::new_with_interrupts(
+                cpu_state,
+                machine.ram_block().as_ptr(),
+                0,
+                opts.ram_size,
+                machine.address_space() as *const _ as u64,
+                Arc::clone(&stop_flag),
+                interrupts,
+            )
+        };
+        manager.add_loongarch_cpu(cpu);
+    }
+
+    let mut backend = X86_64CodeGen::new();
+    backend.set_guest_base_offset(GUEST_BASE_CPU_OFFSET);
+    backend.mmio = Some(loongarch_soft_mmu_config());
+    backend.neg_align_off = i32::try_from(NEG_ALIGN_CPU_OFFSET).unwrap();
+    let env = ExecEnv::new(backend);
+    let shared = env.shared.clone();
+
+    let (tx, rx) = mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let exit = unsafe { manager.run(&shared) };
+        tx.send(exit).unwrap();
+    });
+    assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+
+    stop_flag.store(false, Ordering::SeqCst);
+    wake_secondary.set_ipi_interrupt_pending(true);
+    let exit = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(exit, ExitReason::Halted);
+    handle.join().unwrap();
+}
+
+#[test]
+fn task97_threaded_loongarch_buffer_full_continues_until_stop() {
+    let mut opts = default_opts();
+    opts.cpu_count = 2;
+
+    let mut machine = LoongArchVirtMachine::new();
+    machine.init(&opts).unwrap();
+    machine.address_space().write(
+        GPA::new(VIRT_RAM_BASE),
+        4,
+        u64::from(code15_insn(IDLE_OP, 0)),
+    );
+
+    let mut manager = CpuManager::new();
+    let stop_flag = manager.running_flag();
+    for (cpu_state, interrupts) in machine.take_runtime_cpu_states().unwrap() {
+        let cpu = unsafe {
+            LoongArchFullSystemCpu::new_with_interrupts(
+                cpu_state,
+                machine.ram_block().as_ptr(),
+                0,
+                opts.ram_size,
+                machine.address_space() as *const _ as u64,
+                Arc::clone(&stop_flag),
+                interrupts,
+            )
+        };
+        manager.add_loongarch_cpu(cpu);
+    }
+
+    let mut backend = X86_64CodeGen::new();
+    backend.set_guest_base_offset(GUEST_BASE_CPU_OFFSET);
+    backend.mmio = Some(loongarch_soft_mmu_config());
+    backend.neg_align_off = i32::try_from(NEG_ALIGN_CPU_OFFSET).unwrap();
+    let env = ExecEnv::with_code_buffer_size(backend, 4096);
+    let shared = env.shared.clone();
+
+    let (tx, rx) = mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let exit = unsafe { manager.run(&shared) };
+        tx.send(exit).unwrap();
+    });
+
+    assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+    stop_flag.store(false, Ordering::SeqCst);
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        ExitReason::Halted
+    );
+    handle.join().unwrap();
 }
 
 #[test]

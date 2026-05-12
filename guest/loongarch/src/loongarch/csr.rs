@@ -1,4 +1,4 @@
-use super::cpu::{LoongArchCpu, NUM_SAVE};
+use super::cpu::{LoongArchCpu, NUM_GCSR, NUM_SAVE};
 
 pub const CSR_CRMD: u32 = 0x0;
 pub const CSR_PRMD: u32 = 0x1;
@@ -14,6 +14,8 @@ pub const CSR_TLBIDX: u32 = 0x10;
 pub const CSR_TLBEHI: u32 = 0x11;
 pub const CSR_TLBELO0: u32 = 0x12;
 pub const CSR_TLBELO1: u32 = 0x13;
+pub const CSR_GTLBC: u32 = 0x15;
+pub const CSR_TRGP: u32 = 0x16;
 pub const CSR_ASID: u32 = 0x18;
 pub const CSR_PGDL: u32 = 0x19;
 pub const CSR_PGDH: u32 = 0x1A;
@@ -33,6 +35,11 @@ pub const CSR_TCFG: u32 = 0x41;
 pub const CSR_TVAL: u32 = 0x42;
 pub const CSR_CNTC: u32 = 0x43;
 pub const CSR_TICLR: u32 = 0x44;
+pub const CSR_GSTAT: u32 = 0x50;
+pub const CSR_GCFG: u32 = 0x51;
+pub const CSR_GCTL: u32 = CSR_GCFG;
+pub const CSR_GINTC: u32 = 0x52;
+pub const CSR_GCNTC: u32 = 0x53;
 pub const CSR_LLBCTL: u32 = 0x60;
 pub const CSR_TLBRENTRY: u32 = 0x88;
 pub const CSR_TLBRBADV: u32 = 0x89;
@@ -59,6 +66,14 @@ pub const EUEN_SXE: u64 = 1 << 1;
 pub const EUEN_ASXE: u64 = 1 << 2;
 
 pub const ESTAT_IS_MASK: u64 = 0x1FFF;
+pub const GSTAT_VM: u64 = 1 << 0;
+pub const GSTAT_PVM: u64 = 1 << 1;
+pub const GSTAT_GIDBIT: u64 = 8 << 4;
+pub const GSTAT_GID: u64 = 0xFF << 16;
+pub const GSTAT_GID_SHIFT: u64 = 16;
+pub const GTLBC_USETGID: u64 = 1 << 12;
+pub const GTLBC_TGID: u64 = 0xFF << 16;
+pub const GTLBC_TGID_SHIFT: u64 = 16;
 
 pub const CRMD_WRITE_MASK: u64 =
     CRMD_PLV_MASK | CRMD_IE | CRMD_DA | CRMD_PG | CRMD_DATF | CRMD_DATM;
@@ -75,6 +90,8 @@ pub const EENTRY_WRITE_MASK: u64 = !0x3F_u64;
 pub const TLBIDX_WRITE_MASK: u64 = 0xBF00_0FFF;
 pub const TLBEHI_WRITE_MASK: u64 = !0x1FFF_u64;
 pub const TLBELO_WRITE_MASK: u64 = 0xE000_FFFF_FFFF_FFFF;
+pub const GTLBC_WRITE_MASK: u64 = 0x00FF_303F;
+pub const TRGP_WRITE_MASK: u64 = 0;
 pub const ASID_WRITE_MASK: u64 = 0x3FF;
 pub const PGDL_WRITE_MASK: u64 = !0xFFF_u64;
 pub const PGDH_WRITE_MASK: u64 = !0xFFF_u64;
@@ -92,6 +109,10 @@ pub const TCFG_WRITE_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 pub const TVAL_WRITE_MASK: u64 = 0;
 pub const CNTC_WRITE_MASK: u64 = u64::MAX;
 pub const TICLR_WRITE_MASK: u64 = 0x1;
+pub const GSTAT_WRITE_MASK: u64 = GSTAT_PVM | GSTAT_GID;
+pub const GCFG_WRITE_MASK: u64 = 0x07BF_FFF7;
+pub const GINTC_WRITE_MASK: u64 = 0x00FF_FFFF;
+pub const GCNTC_WRITE_MASK: u64 = u64::MAX;
 pub const LLBCTL_WRITE_MASK: u64 = 0x4;
 pub const TLBRENTRY_WRITE_MASK: u64 = !0x3F_u64;
 pub const TLBRBADV_WRITE_MASK: u64 = u64::MAX;
@@ -127,6 +148,8 @@ impl LoongArchCpu {
             CSR_TLBEHI => self.tlbehi,
             CSR_TLBELO0 => self.tlbelo0,
             CSR_TLBELO1 => self.tlbelo1,
+            CSR_GTLBC => self.gtlbc,
+            CSR_TRGP => self.trgp,
             CSR_ASID => self.asid | (0x0A << 16),
             CSR_PGDL => self.pgdl,
             CSR_PGDH => self.pgdh,
@@ -155,6 +178,10 @@ impl LoongArchCpu {
             CSR_TVAL => self.tval,
             CSR_CNTC => self.cntc,
             CSR_TICLR => 0,
+            CSR_GSTAT => self.gstat | GSTAT_GIDBIT,
+            CSR_GCFG => self.gcfg,
+            CSR_GINTC => self.gintc,
+            CSR_GCNTC => self.gcntc,
             CSR_LLBCTL => self.llbctl,
             CSR_TLBRENTRY => self.tlbrentry,
             CSR_TLBRBADV => self.tlbrbadv,
@@ -193,10 +220,123 @@ impl LoongArchCpu {
         old
     }
 
+    pub fn gcsr_read(&self, num: u32) -> u64 {
+        if !valid_gcsr(num) {
+            return 0;
+        }
+
+        match num {
+            CSR_PGD => {
+                let badv = if self.gcsr[CSR_TLBRERA as usize] & 1 != 0 {
+                    self.gcsr[CSR_TLBRBADV as usize]
+                } else {
+                    self.gcsr[CSR_BADV as usize]
+                };
+                if badv & (1 << 63) != 0 {
+                    self.gcsr[CSR_PGDH as usize]
+                } else {
+                    self.gcsr[CSR_PGDL as usize]
+                }
+            }
+            CSR_ASID => self.gcsr[CSR_ASID as usize] | (0x0A << 16),
+            CSR_TICLR => 0,
+            _ => self.gcsr[num as usize],
+        }
+    }
+
+    pub fn gcsr_write(&mut self, num: u32, val: u64) {
+        let mask = gcsr_write_mask(num);
+        if mask == 0 {
+            return;
+        }
+        self.gcsr_write_masked(num, val, mask);
+    }
+
+    pub fn gcsr_xchg(&mut self, num: u32, val: u64, mask: u64) -> u64 {
+        let old = self.gcsr_read(num);
+        let wmask = gcsr_write_mask(num) & mask;
+        if wmask != 0 {
+            let new = (old & !wmask) | (val & wmask);
+            self.gcsr_write_raw(num, new);
+        }
+        old
+    }
+
     fn csr_write_masked(&mut self, num: u32, val: u64, mask: u64) {
         let old = self.csr_read(num);
         let new = (old & !mask) | (val & mask);
         self.csr_write_raw(num, new);
+    }
+
+    fn gcsr_write_masked(&mut self, num: u32, val: u64, mask: u64) {
+        let old = self.gcsr_read(num);
+        let new = (old & !mask) | (val & mask);
+        self.gcsr_write_raw(num, new);
+    }
+
+    fn gcsr_write_raw(&mut self, num: u32, val: u64) {
+        if !valid_gcsr(num) || num == CSR_PGD {
+            return;
+        }
+
+        match num {
+            CSR_CRMD => {
+                let old = self.gcsr[num as usize];
+                self.gcsr[num as usize] = val;
+                if (old ^ val) & (CRMD_PLV_MASK | CRMD_DA | CRMD_PG) != 0 {
+                    self.flush_fast_tlb();
+                }
+            }
+            CSR_ECFG => {
+                let was_pending = self.pending_interrupt();
+                self.gcsr[num as usize] = val;
+                if self.in_guest_mode() {
+                    self.wake_if_new_enabled_interrupt(was_pending);
+                }
+            }
+            CSR_ESTAT => {
+                let was_pending = self.pending_interrupt();
+                self.gcsr[num as usize] = (self.gcsr[num as usize]
+                    & !ESTAT_WRITE_MASK)
+                    | (val & ESTAT_WRITE_MASK);
+                if self.in_guest_mode() {
+                    self.wake_if_new_enabled_interrupt(was_pending);
+                }
+            }
+            CSR_TCFG => {
+                self.gcsr[num as usize] = val;
+                if self.in_guest_mode() && val & 1 != 0 {
+                    self.gcsr[CSR_TVAL as usize] = val & !0x3;
+                }
+            }
+            CSR_TICLR if val & 1 != 0 => {
+                self.set_guest_interrupt_bit_pending(11, false);
+            }
+            CSR_TICLR => {}
+            CSR_ASID => {
+                let old = self.gcsr[num as usize];
+                self.gcsr[num as usize] =
+                    (old & !ASID_WRITE_MASK) | (val & ASID_WRITE_MASK);
+                if (old ^ self.gcsr[num as usize]) & ASID_WRITE_MASK != 0 {
+                    self.invalidate_tlb_translations();
+                }
+            }
+            CSR_STLBPS => {
+                let old = self.gcsr[num as usize];
+                self.gcsr[num as usize] = val;
+                if old != val {
+                    self.invalidate_tlb_translations();
+                }
+            }
+            CSR_DMW0 | CSR_DMW1 | CSR_DMW2 | CSR_DMW3 => {
+                let old = self.gcsr[num as usize];
+                self.gcsr[num as usize] = val;
+                if old != val {
+                    self.invalidate_tlb_translations();
+                }
+            }
+            _ => self.gcsr[num as usize] = val,
+        }
     }
 
     fn csr_write_raw(&mut self, num: u32, val: u64) {
@@ -223,6 +363,14 @@ impl LoongArchCpu {
             CSR_TLBEHI => self.tlbehi = val,
             CSR_TLBELO0 => self.tlbelo0 = val,
             CSR_TLBELO1 => self.tlbelo1 = val,
+            CSR_GTLBC => {
+                let old = self.gtlbc & (GTLBC_USETGID | GTLBC_TGID);
+                self.gtlbc = val;
+                if old != self.gtlbc & (GTLBC_USETGID | GTLBC_TGID) {
+                    self.invalidate_tlb_translations();
+                }
+            }
+            CSR_TRGP => self.trgp = val,
             CSR_ASID => {
                 self.set_asid_low(val);
             }
@@ -249,6 +397,22 @@ impl LoongArchCpu {
                 self.set_timer_interrupt_pending(false);
             }
             CSR_TICLR => {}
+            CSR_GSTAT => {
+                let old_gid = self.gstat & GSTAT_GID;
+                self.gstat = (self.gstat & GSTAT_VM) | (val & GSTAT_WRITE_MASK);
+                if old_gid != self.gstat & GSTAT_GID {
+                    self.invalidate_tlb_translations();
+                }
+            }
+            CSR_GCFG => self.gcfg = val,
+            CSR_GINTC => {
+                let pending_mask = 0xFF << 2;
+                self.gintc = val & 0x00FF_FF00;
+                self.gcsr[CSR_ESTAT as usize] = (self.gcsr[CSR_ESTAT as usize]
+                    & !pending_mask)
+                    | ((val & 0xFF) << 2);
+            }
+            CSR_GCNTC => self.gcntc = val,
             CSR_LLBCTL if val & 0x4 != 0 => {
                 self.llbctl &= !1;
             }
@@ -288,6 +452,8 @@ pub const fn csr_write_mask(num: u32) -> u64 {
         CSR_TLBIDX => TLBIDX_WRITE_MASK,
         CSR_TLBEHI => TLBEHI_WRITE_MASK,
         CSR_TLBELO0 | CSR_TLBELO1 => TLBELO_WRITE_MASK,
+        CSR_GTLBC => GTLBC_WRITE_MASK,
+        CSR_TRGP => TRGP_WRITE_MASK,
         CSR_ASID => ASID_WRITE_MASK,
         CSR_PGDL => PGDL_WRITE_MASK,
         CSR_PGDH => PGDH_WRITE_MASK,
@@ -305,6 +471,10 @@ pub const fn csr_write_mask(num: u32) -> u64 {
         CSR_TVAL => TVAL_WRITE_MASK,
         CSR_CNTC => CNTC_WRITE_MASK,
         CSR_TICLR => TICLR_WRITE_MASK,
+        CSR_GSTAT => GSTAT_WRITE_MASK,
+        CSR_GCFG => GCFG_WRITE_MASK,
+        CSR_GINTC => GINTC_WRITE_MASK,
+        CSR_GCNTC => GCNTC_WRITE_MASK,
         CSR_LLBCTL => LLBCTL_WRITE_MASK,
         CSR_TLBRENTRY => TLBRENTRY_WRITE_MASK,
         CSR_TLBRBADV => TLBRBADV_WRITE_MASK,
@@ -317,4 +487,33 @@ pub const fn csr_write_mask(num: u32) -> u64 {
         n if n >= CSR_SAVE0 && n <= CSR_SAVE_LAST => SAVE_WRITE_MASK,
         _ => 0,
     }
+}
+
+pub const fn gcsr_write_mask(num: u32) -> u64 {
+    if !valid_gcsr(num) {
+        return 0;
+    }
+    match num {
+        CSR_BADI | CSR_TVAL | CSR_CPUID | CSR_PRCFG1 | CSR_PRCFG2
+        | CSR_PRCFG3 => 0,
+        CSR_PGD => 0,
+        _ => csr_write_mask(num),
+    }
+}
+
+pub const fn valid_gcsr(num: u32) -> bool {
+    if is_hypervisor_csr(num) {
+        return false;
+    }
+
+    (num <= CSR_LLBCTL)
+        || (num >= CSR_TLBRENTRY && num <= CSR_TLBRPRMD)
+        || (num >= CSR_DMW0 && num <= CSR_DMW3 && num < NUM_GCSR as u32)
+}
+
+const fn is_hypervisor_csr(num: u32) -> bool {
+    matches!(
+        num,
+        CSR_GTLBC | CSR_TRGP | CSR_GSTAT | CSR_GCFG | CSR_GINTC | CSR_GCNTC
+    )
 }

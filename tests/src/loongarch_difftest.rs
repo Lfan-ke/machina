@@ -37,6 +37,8 @@ const OP_ADDI_D: u32 = 0b0000001011;
 const OP_ADDU16I_D: u32 = 0b000100;
 const OP_CLZ_D: u32 = 0b0000000000000000001001;
 const OP_BITREV_D: u32 = 0b0000000000000000010101;
+const OP_BYTEPICK_W: u32 = 0b000000000000100;
+const OP_BYTEPICK_D: u32 = 0b00000000000011;
 const OP_EXT_W_B: u32 = 0b0000000000000000010111;
 const OP_BSTR_W: u32 = 0b00000000011;
 const OP_BSTRINS_D: u32 = 0b0000000010;
@@ -56,6 +58,10 @@ const OP_LD_BU: u32 = 0b0010101000;
 const OP_LD_HU: u32 = 0b0010101001;
 const OP_LD_WU: u32 = 0b0010101010;
 const OP_PRELD: u32 = 0b0010101011;
+const OP_LDPTR_W: u32 = 0b00100100;
+const OP_STPTR_W: u32 = 0b00100101;
+const OP_LDPTR_D: u32 = 0b00100110;
+const OP_STPTR_D: u32 = 0b00100111;
 const OP_LDGT_B: u32 = 0b00111000011110000;
 const OP_LDLE_B: u32 = 0b00111000011110100;
 const OP_STLE_B: u32 = 0b00111000011111100;
@@ -92,6 +98,10 @@ fn r3_sa2(op: u32, sa2: u32, rk: u32, rj: u32, rd: u32) -> u32 {
     (op << 17) | (sa2 << 15) | (rk << 10) | (rj << 5) | rd
 }
 
+fn r3_sa3(op: u32, sa3: u32, rk: u32, rj: u32, rd: u32) -> u32 {
+    (op << 18) | (sa3 << 15) | (rk << 10) | (rj << 5) | rd
+}
+
 fn r2_si16(op: u32, si16: i16, rj: u32, rd: u32) -> u32 {
     (op << 26) | ((si16 as u16 as u32) << 10) | (rj << 5) | rd
 }
@@ -115,6 +125,10 @@ fn r1_si20(op: u32, si20: i32, rd: u32) -> u32 {
 
 fn r2_si12(op: u32, si12: i16, rj: u32, rd: u32) -> u32 {
     (op << 22) | ((si12 as u16 as u32 & 0x0FFF) << 10) | (rj << 5) | rd
+}
+
+fn r2_si14(op: u32, si14: i16, rj: u32, rd: u32) -> u32 {
+    (op << 24) | ((si14 as u16 as u32 & 0x3FFF) << 10) | (rj << 5) | rd
 }
 
 fn r2(op: u32, rj: u32, rd: u32) -> u32 {
@@ -492,6 +506,8 @@ fn loongarch_difftest_task6_task10_integer_matrix() {
                 (5, 0xFFFF_0000_0000_0000),
                 (6, 0x123),
                 (9, 0x80),
+                (18, 0x1122_3344_5566_7788),
+                (19, 0x99AA_BBCC_DDEE_FF00),
             ],
             init_mem: vec![],
             machina_insns: vec![
@@ -499,14 +515,22 @@ fn loongarch_difftest_task6_task10_integer_matrix() {
                 bstr_w(true, 31, 0, 4, 7),
                 bstr_d(OP_BSTRINS_D, 11, 4, 6, 5),
                 r2(OP_EXT_W_B, 9, 8),
+                r3_sa2(OP_BYTEPICK_W, 1, 19, 18, 20),
+                r3_sa3(OP_BYTEPICK_D, 4, 19, 18, 21),
+                r3_sa2(OP_BYTEPICK_W, 0, 19, 18, 22),
+                r3_sa3(OP_BYTEPICK_D, 0, 19, 18, 23),
             ],
             qemu_asm: &[
                 "bstrpick.d $r1, $r2, 63, 63",
                 "bstrpick.w $r7, $r4, 31, 0",
                 "bstrins.d $r5, $r6, 11, 4",
                 "ext.w.b $r8, $r9",
+                "bytepick.w $r20, $r18, $r19, 1",
+                "bytepick.d $r21, $r18, $r19, 4",
+                "bytepick.w $r22, $r18, $r19, 0",
+                "bytepick.d $r23, $r18, $r19, 0",
             ],
-            compare: &[1, 5, 7, 8],
+            compare: &[1, 5, 7, 8, 20, 21, 22, 23],
         },
         LoongArchDifftestCase {
             name: "round14 broader alu matrix",
@@ -552,6 +576,8 @@ fn loongarch_difftest_task6_task10_integer_matrix() {
                 (11, 0xBEEF),
                 (13, 0x1122_3344),
                 (14, 0x5566_7788_99AA_BBCC),
+                (17, 0x0123_4567_89AB_CDEF),
+                (18, 0x0000_0000_8000_0001),
             ],
             init_mem: vec![
                 (0, 0x80),
@@ -587,6 +613,10 @@ fn loongarch_difftest_task6_task10_integer_matrix() {
                 r2_si12(OP_ST_D, 32, MEMORY_BASE_REG as u32, 14),
                 r2_si12(OP_LD_D, 32, MEMORY_BASE_REG as u32, 16),
                 r2_si12(OP_LD_D, 8, MEMORY_BASE_REG as u32, 0),
+                r2_si14(OP_STPTR_D, 10, MEMORY_BASE_REG as u32, 17),
+                r2_si14(OP_LDPTR_D, 10, MEMORY_BASE_REG as u32, 19),
+                r2_si14(OP_STPTR_W, 12, MEMORY_BASE_REG as u32, 18),
+                r2_si14(OP_LDPTR_W, 12, MEMORY_BASE_REG as u32, 22),
             ],
             qemu_asm: &[
                 "ld.b $r1, $r20, 0",
@@ -605,8 +635,12 @@ fn loongarch_difftest_task6_task10_integer_matrix() {
                 "st.d $r14, $r20, 32",
                 "ld.d $r16, $r20, 32",
                 "ld.d $r0, $r20, 8",
+                "stptr.d $r17, $r20, 40",
+                "ldptr.d $r19, $r20, 40",
+                "stptr.w $r18, $r20, 48",
+                "ldptr.w $r22, $r20, 48",
             ],
-            compare: &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 15, 16],
+            compare: &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 15, 16, 19, 22],
         },
         LoongArchDifftestCase {
             name: "task81 preld and predicate memory success matrix",

@@ -17,7 +17,12 @@ pub const ECODE_FPD: u32 = 0xF;
 pub const ECODE_SXD: u32 = 0x10;
 pub const ECODE_ASXD: u32 = 0x11;
 pub const ECODE_FPE: u32 = 0x12;
+pub const ECODE_GSPR: u32 = 0x16;
+pub const ECODE_HVC: u32 = 0x17;
+pub const ECODE_GCM: u32 = 0x18;
 pub const ECODE_TLBR: u32 = 0x3F;
 
 pub const ESUBCODE_ADEF: u32 = 0x0;
 pub const ESUBCODE_ADEM: u32 = 0x1;
+pub const ESUBCODE_GCMC: u32 = 0x0;
+pub const ESUBCODE_GCHC: u32 = 0x1;

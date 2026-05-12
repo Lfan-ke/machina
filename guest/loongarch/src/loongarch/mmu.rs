@@ -17,6 +17,7 @@ pub struct TlbEntry {
     pub vppn: u64,
     pub page_size: u8,
     pub asid: u16,
+    pub gid: u8,
     pub g: bool,
     pub valid: bool,
     pub ppn0: u64,
@@ -135,6 +136,7 @@ impl LoongArchMmu {
             vppn: 0,
             page_size: 0,
             asid: 0,
+            gid: 0,
             g: false,
             valid: false,
             ppn0: 0,
@@ -211,10 +213,16 @@ impl LoongArchMmu {
             *entry = FastTlbEntry::default();
         }
 
+        let access_tag = if addend == FAST_TLB_MMIO_ADDEND {
+            FAST_TLB_INVALID_TAG
+        } else {
+            tag
+        };
+
         match access {
-            AccessType::Load => entry.addr_read = tag,
-            AccessType::Store => entry.addr_write = tag,
-            AccessType::Fetch => entry.addr_code = tag,
+            AccessType::Load => entry.addr_read = access_tag,
+            AccessType::Store => entry.addr_write = access_tag,
+            AccessType::Fetch => entry.addr_code = access_tag,
         }
         entry.addend = addend;
         entry.dirty = 0;
@@ -263,18 +271,17 @@ pub enum AccessType {
     Fetch,
 }
 
-pub fn dmw_match(cpu: &LoongArchCpu, va: u64) -> Option<u64> {
-    let plv = (cpu.crmd() & CRMD_PLV_MASK) as u8;
-    for i in 0..4 {
-        let dmw = cpu.dmw(i);
-        if dmw == 0 {
+pub fn dmw_match_with(crmd: u64, dmw: &[u64; 4], va: u64) -> Option<u64> {
+    let plv = (crmd & CRMD_PLV_MASK) as u8;
+    for &window in dmw {
+        if window == 0 {
             continue;
         }
         let plv_bit = 1_u64 << u64::from(plv);
-        if dmw & plv_bit == 0 {
+        if window & plv_bit == 0 {
             continue;
         }
-        let vseg = (dmw >> 60) & 0xF;
+        let vseg = (window >> 60) & 0xF;
         let va_vseg = (va >> 60) & 0xF;
         if vseg == va_vseg {
             return Some(va & TARGET_VIRT_MASK);
@@ -283,12 +290,23 @@ pub fn dmw_match(cpu: &LoongArchCpu, va: u64) -> Option<u64> {
     None
 }
 
-pub fn direct_map_address(cpu: &LoongArchCpu, va: u64) -> Option<u64> {
-    let crmd = cpu.crmd();
+pub fn dmw_match(cpu: &LoongArchCpu, va: u64) -> Option<u64> {
+    dmw_match_with(cpu.crmd(), &cpu.dmw, va)
+}
+
+pub fn direct_map_address_with(
+    crmd: u64,
+    dmw: &[u64; 4],
+    va: u64,
+) -> Option<u64> {
     if crmd & CRMD_DA != 0 && crmd & CRMD_PG == 0 {
         return Some(va & TARGET_VIRT_MASK);
     }
-    dmw_match(cpu, va)
+    dmw_match_with(crmd, dmw, va)
+}
+
+pub fn direct_map_address(cpu: &LoongArchCpu, va: u64) -> Option<u64> {
+    direct_map_address_with(cpu.crmd(), &cpu.dmw, va)
 }
 
 impl LoongArchMmu {
@@ -296,20 +314,22 @@ impl LoongArchMmu {
         &self,
         va: u64,
         asid: u16,
+        gid: u8,
         stlb_ps: u8,
         access: AccessType,
         plv: u8,
     ) -> TlbLookupResult {
-        if let Some(r) = self.search_mtlb(va, asid, access, plv) {
+        if let Some(r) = self.search_mtlb(va, asid, gid, access, plv) {
             return r;
         }
-        self.search_stlb(va, asid, stlb_ps, access, plv)
+        self.search_stlb(va, asid, gid, stlb_ps, access, plv)
     }
 
     fn search_mtlb(
         &self,
         va: u64,
         asid: u16,
+        gid: u8,
         access: AccessType,
         plv: u8,
     ) -> Option<TlbLookupResult> {
@@ -317,7 +337,7 @@ impl LoongArchMmu {
             if !entry.valid {
                 continue;
             }
-            if let Some(r) = check_entry(entry, va, asid, access, plv) {
+            if let Some(r) = check_entry(entry, va, asid, gid, access, plv) {
                 return Some(r);
             }
         }
@@ -328,6 +348,7 @@ impl LoongArchMmu {
         &self,
         va: u64,
         asid: u16,
+        gid: u8,
         stlb_ps: u8,
         access: AccessType,
         plv: u8,
@@ -342,7 +363,7 @@ impl LoongArchMmu {
             if !entry.valid {
                 continue;
             }
-            if let Some(r) = check_entry(entry, va, asid, access, plv) {
+            if let Some(r) = check_entry(entry, va, asid, gid, access, plv) {
                 return r;
             }
         }
@@ -354,6 +375,7 @@ fn check_entry(
     entry: &TlbEntry,
     va: u64,
     asid: u16,
+    gid: u8,
     access: AccessType,
     plv: u8,
 ) -> Option<TlbLookupResult> {
@@ -367,6 +389,9 @@ fn check_entry(
         return None;
     }
     if !entry.g && entry.asid != asid {
+        return None;
+    }
+    if entry.gid != gid {
         return None;
     }
     let odd = (va >> ps) & 1 != 0;

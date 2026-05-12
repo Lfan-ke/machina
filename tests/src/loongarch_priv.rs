@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use machina_accel::code_buffer::CodeBuffer;
 use machina_accel::exec::{cpu_exec_loop_env, ExecEnv, ExitReason};
+use machina_accel::ir::tb::EXCP_LOONGARCH_DONE;
 use machina_accel::ir::Context;
 use machina_accel::translate::translate_and_execute;
 use machina_accel::{GuestCpu, HostCodeGen, X86_64CodeGen};
@@ -18,16 +19,20 @@ use machina_guest_loongarch::loongarch::trans::{
 };
 use machina_guest_loongarch::translator_loop;
 use machina_system::loongarch_cpu::{
-    loongarch_soft_mmu_config, LoongArchFullSystemCpu, LOONGARCH_TB_FLAG_DA,
-    LOONGARCH_TB_FLAG_FPE, LOONGARCH_TB_FLAG_PG, LOONGARCH_TB_FLAG_PLV_MASK,
+    loongarch_mem_read, loongarch_soft_mmu_config, LoongArchFullSystemCpu,
+    LOONGARCH_TB_FLAG_DA, LOONGARCH_TB_FLAG_FPE, LOONGARCH_TB_FLAG_PG,
+    LOONGARCH_TB_FLAG_PLV_MASK,
 };
 
 const TLBREHI_EXPECTED_WRITE_MASK: u64 = !0x1FC0_u64;
 const ERTN_INSN: u32 = 0x0648_3800;
 const SYSCALL_OP: u32 = 0b00000000001010110;
 const BREAK_OP: u32 = 0b00000000001010100;
+const HVCL_OP: u32 = 0b00000000001010111;
 const IDLE_OP: u32 = 0b00000110010010001;
 const IOCSRRD_W_OP: u32 = 0b0000011001001000000010;
+const IOCSRWR_W_OP: u32 = 0b0000011001001000000110;
+const CPUCFG_OP: u32 = 0b0000000000000000011011;
 const OP_ADDI_D: u32 = 0b0000001011;
 const OP_LD_D: u32 = 0b0010100011;
 const OP_ST_W: u32 = 0b0010100110;
@@ -144,6 +149,23 @@ fn write_test_tlb_entry(
     cpu.tlb_write(index);
 }
 
+fn write_guest_test_tlb_entry(
+    cpu: &mut LoongArchCpu,
+    index: usize,
+    va: u64,
+    page_size: u8,
+    asid: u16,
+    elo0: u64,
+    elo1: u64,
+) {
+    cpu.gcsr_write(CSR_TLBEHI, tlb_pair_base(va, page_size) & !0x1FFF);
+    cpu.gcsr_write(CSR_TLBELO0, elo0);
+    cpu.gcsr_write(CSR_TLBELO1, elo1);
+    cpu.gcsr_write(CSR_ASID, u64::from(asid));
+    cpu.gcsr_write(CSR_TLBIDX, (u64::from(page_size) << 24) | index as u64);
+    cpu.tlb_write(index);
+}
+
 fn expected_tlb_addend(cpu: &LoongArchCpu, va: u64, pa: u64) -> usize {
     cpu.guest_base_val()
         .wrapping_add(pa & PAGE_MASK_4K)
@@ -152,6 +174,10 @@ fn expected_tlb_addend(cpu: &LoongArchCpu, va: u64, pa: u64) -> usize {
 
 fn csr_insn(csr_num: u32, rj: u32, rd: u32) -> u32 {
     (0b00000100 << 24) | ((csr_num & 0x3FFF) << 10) | (rj << 5) | rd
+}
+
+fn gcsr_insn(csr_num: u32, rj: u32, rd: u32) -> u32 {
+    (0b00000101 << 24) | ((csr_num & 0x3FFF) << 10) | (rj << 5) | rd
 }
 
 fn code15_insn(op: u32, code: u32) -> u32 {
@@ -208,6 +234,16 @@ fn run_priv_la_at(cpu: &mut LoongArchCpu, insns: &[u32], pc: u64) -> usize {
     translator_loop::<LoongArchTranslator>(&mut ctx, &mut ir);
 
     unsafe { translate_and_execute(&mut ir, &backend, &mut buf, cpu.env_ptr()) }
+}
+
+fn enter_guest_mode_for_test(cpu: &mut LoongArchCpu) {
+    cpu.csr_xchg(CSR_GSTAT, GSTAT_PVM, GSTAT_PVM);
+    let _ = unsafe {
+        machina_guest_loongarch::loongarch::trans::helpers
+            ::loongarch_helper_ertn(cpu.env_ptr())
+    };
+    assert_ne!(cpu.csr_read(CSR_GSTAT) & GSTAT_VM, 0);
+    assert_eq!(cpu.csr_read(CSR_GSTAT) & GSTAT_PVM, 0);
 }
 
 fn full_system_cpu(cpu: LoongArchCpu) -> LoongArchFullSystemCpu {
@@ -1132,11 +1168,13 @@ fn cpucfg_index2_reports_fp_no_lsx() {
             ::loongarch_helper_cpucfg(cpu.env_ptr(), 2)
     };
     assert_eq!(result, LoongArchCfg::default().cpucfg2());
-    assert_eq!(result, 0x0060_C00F);
+    assert_eq!(result, 0x0060_CC0F);
     assert_ne!(result & 1, 0); // FP_SP
     assert_ne!(result & 2, 0); // FP_DP
     assert_eq!(result & (1 << 6), 0); // LSX=0
     assert_eq!(result & (1 << 7), 0); // LASX=0
+    assert_ne!(result & (1 << 10), 0); // LVZ=1
+    assert_ne!(result & (0x7 << 11), 0); // LVZ_VER non-zero
     assert_eq!(result & (1 << 18), 0); // LBT_X86=0
     assert_eq!(result & (1 << 19), 0); // LBT_ARM=0
     assert_eq!(result & (1 << 20), 0); // LBT_MIPS=0
@@ -1155,9 +1193,756 @@ fn cpucfg_index2_derives_lsx_lasx_from_cpu_config() {
         machina_guest_loongarch::loongarch::trans::helpers
             ::loongarch_helper_cpucfg(cpu.env_ptr(), 2)
     };
-    assert_eq!(result, 0x0060_C0CF);
+    assert_eq!(result, 0x0060_CCCF);
     assert_ne!(result & (1 << 6), 0);
     assert_ne!(result & (1 << 7), 0);
+}
+
+#[test]
+fn lvz_guest_control_csrs_report_gid_bits_and_mask_writes() {
+    let mut cpu = LoongArchCpu::new();
+
+    assert_eq!((cpu.csr_read(CSR_GSTAT) >> 4) & 0x3F, 8);
+
+    cpu.csr_write(CSR_GSTAT, u64::MAX);
+    assert_eq!(cpu.csr_read(CSR_GSTAT) & 0x00FF_0002, 0x00FF_0002);
+    assert_eq!(cpu.csr_read(CSR_GSTAT) & 1, 0);
+    assert_eq!((cpu.csr_read(CSR_GSTAT) >> 4) & 0x3F, 8);
+
+    cpu.csr_write(CSR_GTLBC, u64::MAX);
+    assert_eq!(cpu.csr_read(CSR_GTLBC), 0x00FF_303F);
+}
+
+#[test]
+fn lvz_gintc_write_injects_guest_interrupt_pending_bits() {
+    let mut cpu = LoongArchCpu::new();
+
+    cpu.gcsr_write(CSR_ESTAT, 0x3);
+    cpu.csr_write(CSR_GINTC, 0x00FF_FF55);
+
+    assert_eq!(cpu.csr_read(CSR_GINTC), 0x00FF_FF00);
+    assert_eq!(cpu.gcsr_read(CSR_ESTAT) & 0x3FF, 0x157);
+}
+
+#[test]
+fn lvz_gintc_hwip_routes_hwi_to_guest_estat() {
+    let mut cpu = LoongArchCpu::new();
+
+    cpu.csr_write(CSR_GINTC, 0x0000_FF00);
+    cpu.set_hwi_interrupt_pending(3, true);
+
+    assert_eq!(cpu.csr_read(CSR_ESTAT) & (1 << 5), 0);
+    assert_eq!(cpu.gcsr_read(CSR_ESTAT) & (1 << 5), 1 << 5);
+
+    cpu.set_hwi_interrupt_pending(3, false);
+    assert_eq!(cpu.gcsr_read(CSR_ESTAT) & (1 << 5), 0);
+}
+
+#[test]
+fn lvz_ertn_with_previous_guest_mode_enters_guest_mode() {
+    let mut cpu = LoongArchCpu::new();
+    cpu.csr_write(CSR_ERA, 0x8020_0000);
+    cpu.csr_xchg(CSR_GSTAT, 0x2, 0x2);
+
+    let pc = unsafe {
+        machina_guest_loongarch::loongarch::trans::helpers
+            ::loongarch_helper_ertn(cpu.env_ptr())
+    };
+
+    assert_eq!(pc, 0x8020_0000);
+    assert_ne!(cpu.csr_read(CSR_GSTAT) & 1, 0);
+    assert_eq!(cpu.csr_read(CSR_GSTAT) & 0x2, 0);
+}
+
+#[test]
+fn lvz_guest_ertn_restores_guest_prmd_and_era() {
+    let mut cpu = LoongArchCpu::new();
+    cpu.csr_write(CSR_ERA, 0x9000_0000);
+    cpu.gcsr_write(CSR_CRMD, CRMD_DA);
+    cpu.gcsr_write(CSR_PRMD, CRMD_PLV_MASK | CRMD_IE);
+    cpu.gcsr_write(CSR_ERA, 0x8000_2000);
+    cpu.gcsr_write(CSR_TLBRERA, 0);
+    enter_guest_mode_for_test(&mut cpu);
+
+    let pc = unsafe {
+        machina_guest_loongarch::loongarch::trans::helpers
+            ::loongarch_helper_ertn(cpu.env_ptr())
+    };
+
+    assert_eq!(pc, 0x8000_2000);
+    assert_ne!(cpu.csr_read(CSR_GSTAT) & GSTAT_VM, 0);
+    assert_eq!(
+        cpu.gcsr_read(CSR_CRMD) & (CRMD_PLV_MASK | CRMD_IE),
+        CRMD_PLV_MASK | CRMD_IE
+    );
+    assert_ne!(cpu.gcsr_read(CSR_CRMD) & CRMD_DA, 0);
+    assert_eq!(cpu.csr_read(CSR_ERA), 0x9000_0000);
+}
+
+#[test]
+fn lvz_guest_tlbr_ertn_restores_guest_tlbrprmd() {
+    let mut cpu = LoongArchCpu::new();
+    cpu.gcsr_write(CSR_CRMD, CRMD_DA);
+    cpu.gcsr_write(CSR_TLBRPRMD, CRMD_PLV_MASK | CRMD_IE);
+    cpu.gcsr_write(CSR_TLBRERA, 0x8000_3000 | 1);
+    enter_guest_mode_for_test(&mut cpu);
+
+    let pc = unsafe {
+        machina_guest_loongarch::loongarch::trans::helpers
+            ::loongarch_helper_ertn(cpu.env_ptr())
+    };
+
+    assert_eq!(pc, 0x8000_3000);
+    assert_eq!(cpu.gcsr_read(CSR_TLBRERA) & 1, 0);
+    assert_eq!(cpu.gcsr_read(CSR_CRMD) & CRMD_DA, 0);
+    assert_ne!(cpu.gcsr_read(CSR_CRMD) & CRMD_PG, 0);
+    assert_eq!(
+        cpu.gcsr_read(CSR_CRMD) & (CRMD_PLV_MASK | CRMD_IE),
+        CRMD_PLV_MASK | CRMD_IE
+    );
+    assert_eq!(cpu.csr_read(CSR_TLBRERA), 0);
+}
+
+#[test]
+fn translated_gcsrwr_and_gcsrrd_access_guest_csr_state() {
+    let mut cpu = LoongArchCpu::new();
+    cpu.write_gpr(4, 0x9000_0000);
+
+    assert_eq!(run_priv_la(&mut cpu, &[gcsr_insn(CSR_EENTRY, 1, 4)]), 0);
+    assert_eq!(
+        run_priv_la_at(&mut cpu, &[gcsr_insn(CSR_EENTRY, 0, 5)], 4),
+        0
+    );
+    assert_eq!(cpu.read_gpr(4), 0);
+    assert_eq!(cpu.read_gpr(5), 0x9000_0000);
+    assert_eq!(cpu.csr_read(CSR_EENTRY), 0);
+}
+
+#[test]
+fn translated_hvcl_raises_hvc_exception() {
+    let mut cpu = LoongArchCpu::new();
+    cpu.csr_write(CSR_EENTRY, 0x9000_0000);
+
+    assert_eq!(
+        run_priv_la(&mut cpu, &[code15_insn(HVCL_OP, 0x100)]),
+        EXCP_LOONGARCH_DONE as usize
+    );
+    assert_eq!(cpu.pc(), 0x9000_0000);
+    assert_eq!((cpu.csr_read(CSR_ESTAT) >> 16) & 0x3F, 23);
+    assert_eq!(cpu.csr_read(CSR_ERA), 0);
+}
+
+#[test]
+fn translated_guest_sensitive_ops_raise_gspr() {
+    let cases = [
+        ("cpucfg", r2_insn(CPUCFG_OP, 5, 4)),
+        ("idle", code15_insn(IDLE_OP, 0)),
+        ("cacop", cop_r_si12(CACOP_OP, 0, 0, 0)),
+        ("iocsrrd.w", r2_insn(IOCSRRD_W_OP, 5, 4)),
+        ("iocsrwr.w", r2_insn(IOCSRWR_W_OP, 5, 4)),
+    ];
+
+    for (name, insn) in cases {
+        let mut cpu = LoongArchCpu::new();
+        cpu.csr_write(CSR_EENTRY, 0x9000_0000);
+        cpu.write_gpr(4, 0x55);
+        cpu.write_gpr(5, 2);
+        enter_guest_mode_for_test(&mut cpu);
+
+        assert_eq!(
+            run_priv_la(&mut cpu, &[insn]),
+            EXCP_LOONGARCH_DONE as usize,
+            "{name} did not exit to the hypervisor"
+        );
+        assert_eq!(cpu.pc(), 0x9000_0000, "{name} used wrong vector");
+        assert_eq!(cpu.csr_read(CSR_ERA), 0, "{name} saved wrong ERA");
+        assert_eq!(
+            (cpu.csr_read(CSR_ESTAT) >> 16) & 0x3F,
+            u64::from(ECODE_GSPR),
+            "{name} did not raise GSPR"
+        );
+        assert_eq!(cpu.csr_read(CSR_GSTAT) & GSTAT_VM, 0, "{name} kept VM");
+        assert_ne!(cpu.csr_read(CSR_GSTAT) & GSTAT_PVM, 0, "{name} lost PVM");
+        assert_eq!(cpu.read_gpr(4), 0x55, "{name} changed GPR state");
+        assert!(!cpu.is_halted(), "{name} halted instead of trapping");
+    }
+}
+
+#[test]
+fn translated_guest_csr_access_uses_gcsr_state() {
+    let mut cpu = LoongArchCpu::new();
+    cpu.csr_write(CSR_EENTRY, 0x9000_0000);
+    cpu.gcsr_write(CSR_EENTRY, 0x8000_0000);
+    enter_guest_mode_for_test(&mut cpu);
+
+    assert_eq!(run_priv_la(&mut cpu, &[csr_insn(CSR_EENTRY, 0, 4)]), 0);
+    assert_eq!(cpu.read_gpr(4), 0x8000_0000);
+    assert_eq!(cpu.csr_read(CSR_EENTRY), 0x9000_0000);
+    assert_ne!(cpu.csr_read(CSR_GSTAT) & GSTAT_VM, 0);
+
+    cpu.write_gpr(5, 0x7000_0000);
+    assert_eq!(
+        run_priv_la_at(&mut cpu, &[csr_insn(CSR_EENTRY, 1, 5)], 4),
+        0
+    );
+    assert_eq!(cpu.read_gpr(5), 0x8000_0000);
+    assert_eq!(cpu.gcsr_read(CSR_EENTRY), 0x7000_0000);
+    assert_eq!(cpu.csr_read(CSR_EENTRY), 0x9000_0000);
+}
+
+#[test]
+fn translated_guest_plv3_csr_access_raises_guest_ipe() {
+    let mut cpu = LoongArchCpu::new();
+    cpu.csr_write(CSR_EENTRY, 0x9000_0000);
+    cpu.gcsr_write(CSR_EENTRY, 0x8000_0000);
+    cpu.gcsr_write(CSR_CRMD, CRMD_DA | CRMD_PLV_MASK);
+    cpu.write_gpr(4, 0x55);
+    enter_guest_mode_for_test(&mut cpu);
+
+    assert_eq!(
+        run_priv_la(&mut cpu, &[csr_insn(CSR_EENTRY, 0, 4)]),
+        EXCP_LOONGARCH_DONE as usize
+    );
+    assert_eq!(cpu.pc(), 0x8000_0000);
+    assert_ne!(cpu.csr_read(CSR_GSTAT) & GSTAT_VM, 0);
+    assert_eq!(cpu.csr_read(CSR_GSTAT) & GSTAT_PVM, 0);
+    assert_eq!(cpu.gcsr_read(CSR_ERA), 0);
+    assert_eq!(
+        (cpu.gcsr_read(CSR_ESTAT) >> 16) & 0x3F,
+        u64::from(ECODE_IPE)
+    );
+    assert_eq!(cpu.csr_read(CSR_ERA), 0);
+    assert_eq!(cpu.read_gpr(4), 0x55);
+}
+
+#[test]
+fn translated_guest_invalid_csr_raises_gspr() {
+    let mut cpu = LoongArchCpu::new();
+    cpu.csr_write(CSR_EENTRY, 0x9000_0000);
+    cpu.write_gpr(4, 0x55);
+    enter_guest_mode_for_test(&mut cpu);
+
+    assert_eq!(
+        run_priv_la(&mut cpu, &[csr_insn(0x400, 0, 4)]),
+        EXCP_LOONGARCH_DONE as usize
+    );
+    assert_eq!(cpu.pc(), 0x9000_0000);
+    assert_eq!(cpu.csr_read(CSR_ERA), 0);
+    assert_eq!(
+        (cpu.csr_read(CSR_ESTAT) >> 16) & 0x3F,
+        u64::from(ECODE_GSPR)
+    );
+    assert_eq!(cpu.csr_read(CSR_GSTAT) & GSTAT_VM, 0);
+    assert_ne!(cpu.csr_read(CSR_GSTAT) & GSTAT_PVM, 0);
+    assert_eq!(cpu.read_gpr(4), 0x55);
+}
+
+#[test]
+fn translated_guest_lvz_control_csr_access_raises_gspr() {
+    let mut cpu = LoongArchCpu::new();
+    cpu.csr_write(CSR_EENTRY, 0x9000_0000);
+    cpu.write_gpr(4, 0x55);
+    enter_guest_mode_for_test(&mut cpu);
+
+    assert_eq!(
+        run_priv_la(&mut cpu, &[csr_insn(CSR_GSTAT, 0, 4)]),
+        EXCP_LOONGARCH_DONE as usize
+    );
+    assert_eq!(cpu.pc(), 0x9000_0000);
+    assert_eq!(cpu.csr_read(CSR_ERA), 0);
+    assert_eq!(
+        (cpu.csr_read(CSR_ESTAT) >> 16) & 0x3F,
+        u64::from(ECODE_GSPR)
+    );
+    assert_eq!(cpu.csr_read(CSR_GSTAT) & GSTAT_VM, 0);
+    assert_ne!(cpu.csr_read(CSR_GSTAT) & GSTAT_PVM, 0);
+    assert_eq!(cpu.read_gpr(4), 0x55);
+}
+
+#[test]
+fn translated_guest_syscall_uses_guest_exception_csrs() {
+    let mut cpu = LoongArchCpu::new();
+    cpu.csr_write(CSR_EENTRY, 0x9000_0000);
+    cpu.gcsr_write(CSR_EENTRY, 0x8000_0000);
+    enter_guest_mode_for_test(&mut cpu);
+
+    assert_eq!(
+        run_priv_la(&mut cpu, &[code15_insn(SYSCALL_OP, 0)]),
+        EXCP_LOONGARCH_DONE as usize
+    );
+    assert_eq!(cpu.pc(), 0x8000_0000);
+    assert_ne!(cpu.csr_read(CSR_GSTAT) & GSTAT_VM, 0);
+    assert_eq!(cpu.csr_read(CSR_GSTAT) & GSTAT_PVM, 0);
+    assert_eq!(cpu.gcsr_read(CSR_ERA), 0);
+    assert_eq!(
+        (cpu.gcsr_read(CSR_ESTAT) >> 16) & 0x3F,
+        u64::from(ECODE_SYS)
+    );
+    assert_eq!(cpu.csr_read(CSR_ERA), 0);
+}
+
+#[test]
+fn lvz_guest_interrupt_uses_guest_pending_and_vector_state() {
+    let mut cpu = LoongArchCpu::new();
+    cpu.gcsr_write(CSR_CRMD, 0x8 | CRMD_IE);
+    cpu.gcsr_write(CSR_ECFG, 1 << 5);
+    cpu.gcsr_write(CSR_EENTRY, 0x8000_0000);
+    enter_guest_mode_for_test(&mut cpu);
+
+    cpu.csr_write(CSR_GINTC, 0x0000_FF00);
+    cpu.set_hwi_interrupt_pending(3, true);
+
+    assert_eq!(cpu.pending_interrupt_line(), Some(5));
+    let vec = unsafe {
+        machina_guest_loongarch::loongarch::trans::helpers
+            ::loongarch_helper_raise_exception(cpu.env_ptr(), u64::from(ECODE_INT), 0)
+    };
+    assert_eq!(cpu.external_interrupt_vector(5, vec), 0x8000_0000);
+    assert_ne!(cpu.csr_read(CSR_GSTAT) & GSTAT_VM, 0);
+    assert_eq!(
+        (cpu.gcsr_read(CSR_ESTAT) >> 16) & 0x3F,
+        u64::from(ECODE_INT)
+    );
+    assert_eq!(cpu.gcsr_read(CSR_ERA), 0);
+}
+
+#[test]
+fn lvz_guest_da_translation_uses_guest_crmd_not_host_crmd() {
+    let mut cpu = LoongArchCpu::new();
+    let ps = 12;
+    let idx = mmu::mtlb_flat_index(5).unwrap();
+
+    cpu.csr_write(CSR_CRMD, CRMD_PG);
+    cpu.csr_write(CSR_STLBPS, ps);
+    write_test_tlb_entry(
+        &mut cpu,
+        idx,
+        0x1234,
+        ps as u8,
+        0,
+        tlbelo_test(0, true, true, 0, 0, true, false),
+        tlbelo_test(1, true, true, 0, 0, true, false),
+    );
+    cpu.gcsr_write(CSR_CRMD, CRMD_DA);
+    enter_guest_mode_for_test(&mut cpu);
+
+    assert_tlb_hit(
+        cpu.translate_address(0x1234, mmu::AccessType::Load),
+        0x1234,
+        0,
+    );
+}
+
+#[test]
+fn lvz_guest_paging_ignores_host_direct_map_state() {
+    let mut cpu = LoongArchCpu::new();
+    cpu.csr_write(CSR_CRMD, CRMD_DA);
+    cpu.gcsr_write(CSR_CRMD, CRMD_PG);
+    enter_guest_mode_for_test(&mut cpu);
+
+    assert_eq!(
+        cpu.translate_address(0x1234, mmu::AccessType::Load),
+        mmu::TlbLookupResult::Miss
+    );
+}
+
+#[test]
+fn lvz_guest_paging_uses_guest_tlb_not_host_tlb() {
+    let mut cpu = LoongArchCpu::new();
+    let va = 0x4000_0000;
+    let ps = 12;
+    let idx = mmu::mtlb_flat_index(6).unwrap();
+    let stage2_idx = mmu::mtlb_flat_index(12).unwrap();
+
+    cpu.csr_write(CSR_CRMD, CRMD_PG);
+    cpu.csr_write(CSR_STLBPS, ps);
+    write_test_tlb_entry(
+        &mut cpu,
+        idx,
+        va,
+        ps as u8,
+        0x11,
+        tlbelo_test(0x111, true, true, 0, 1, false, false),
+        tlbelo_test(0x112, true, true, 0, 1, false, false),
+    );
+    write_test_tlb_entry(
+        &mut cpu,
+        stage2_idx,
+        0x220000,
+        ps as u8,
+        0,
+        tlbelo_test(0x551, true, true, 0, 3, true, false),
+        tlbelo_test(0x552, true, true, 0, 3, true, false),
+    );
+
+    cpu.gcsr_write(CSR_CRMD, CRMD_PG);
+    cpu.gcsr_write(CSR_STLBPS, ps);
+    enter_guest_mode_for_test(&mut cpu);
+    write_guest_test_tlb_entry(
+        &mut cpu,
+        idx,
+        va,
+        ps as u8,
+        0x22,
+        tlbelo_test(0x220, true, true, 0, 2, false, false),
+        tlbelo_test(0x221, true, true, 0, 2, false, false),
+    );
+
+    assert_tlb_hit(
+        cpu.translate_address(va, mmu::AccessType::Load),
+        0x551000,
+        3,
+    );
+    assert_tlb_hit(
+        cpu.translate_address(va + 0x1000, mmu::AccessType::Load),
+        0x552000,
+        3,
+    );
+}
+
+#[test]
+fn translated_guest_tlbsrch_uses_guest_tlb_state() {
+    let mut cpu = LoongArchCpu::new();
+    let va = 0x5000_0000;
+    let ps = 12;
+    let idx = mmu::mtlb_flat_index(7).unwrap();
+
+    cpu.csr_write(CSR_EENTRY, 0x9000_0000);
+    cpu.gcsr_write(CSR_CRMD, CRMD_PG);
+    cpu.gcsr_write(CSR_STLBPS, ps);
+    enter_guest_mode_for_test(&mut cpu);
+    write_guest_test_tlb_entry(
+        &mut cpu,
+        idx,
+        va,
+        ps as u8,
+        0x33,
+        tlbelo_test(0x331, true, true, 0, 2, false, false),
+        tlbelo_test(0x332, true, true, 0, 2, false, false),
+    );
+    cpu.gcsr_write(CSR_TLBEHI, tlb_pair_base(va, ps as u8) & !0x1FFF);
+    cpu.gcsr_write(CSR_TLBIDX, 1 << 31);
+
+    assert_eq!(run_priv_la(&mut cpu, &[TLBSRCH_INSN]), 0);
+    assert_ne!(cpu.csr_read(CSR_GSTAT) & GSTAT_VM, 0);
+    assert_eq!(cpu.csr_read(CSR_TLBIDX) & 0xFFF, 0);
+    assert_eq!(cpu.gcsr_read(CSR_TLBIDX) & (1 << 31), 0);
+    assert_eq!(cpu.gcsr_read(CSR_TLBIDX) & 0xFFF, idx as u64);
+}
+
+#[test]
+fn lvz_host_tlb_entries_match_gtlbc_target_gid() {
+    let mut cpu = LoongArchCpu::new();
+    let gpa = 0x6000_0000;
+    let ps = 12;
+    let idx = mmu::mtlb_flat_index(8).unwrap();
+
+    cpu.csr_write(CSR_CRMD, CRMD_PG);
+    cpu.csr_write(CSR_STLBPS, ps);
+    cpu.csr_write(CSR_GTLBC, (1 << 12) | (3 << 16));
+    write_test_tlb_entry(
+        &mut cpu,
+        idx,
+        gpa,
+        ps as u8,
+        0,
+        tlbelo_test(0x701, true, true, 0, 2, true, false),
+        tlbelo_test(0x702, true, true, 0, 2, true, false),
+    );
+
+    assert_tlb_hit(
+        cpu.translate_address(gpa, mmu::AccessType::Load),
+        0x701000,
+        2,
+    );
+
+    cpu.csr_write(CSR_GTLBC, (1 << 12) | (4 << 16));
+    assert_eq!(
+        cpu.translate_address(gpa, mmu::AccessType::Load),
+        mmu::TlbLookupResult::Miss
+    );
+
+    cpu.csr_write(CSR_GTLBC, 0);
+    assert_eq!(
+        cpu.translate_address(gpa, mmu::AccessType::Load),
+        mmu::TlbLookupResult::Miss
+    );
+}
+
+#[test]
+fn lvz_guest_translation_applies_second_stage_host_tlb_gid() {
+    let mut cpu = LoongArchCpu::new();
+    let gid = 7;
+    let gva = 0x4000_0000;
+    let gpa = 0x1000_0000;
+    let ps = 12;
+    let host_idx = mmu::mtlb_flat_index(9).unwrap();
+    let guest_idx = mmu::mtlb_flat_index(10).unwrap();
+
+    cpu.csr_write(CSR_CRMD, CRMD_PG);
+    cpu.csr_write(CSR_STLBPS, ps);
+    cpu.csr_write(CSR_GSTAT, gid << 16);
+    cpu.csr_write(CSR_GTLBC, (1 << 12) | (gid << 16));
+    write_test_tlb_entry(
+        &mut cpu,
+        host_idx,
+        gpa,
+        ps as u8,
+        0,
+        tlbelo_test(0x801, true, true, 0, 1, true, false),
+        tlbelo_test(0x802, true, true, 0, 1, true, false),
+    );
+
+    cpu.gcsr_write(CSR_CRMD, CRMD_PG);
+    cpu.gcsr_write(CSR_STLBPS, ps);
+    enter_guest_mode_for_test(&mut cpu);
+    write_guest_test_tlb_entry(
+        &mut cpu,
+        guest_idx,
+        gva,
+        ps as u8,
+        0x44,
+        tlbelo_test(gpa >> 12, true, true, 0, 2, false, false),
+        tlbelo_test((gpa >> 12) + 1, true, true, 0, 2, false, false),
+    );
+
+    assert_tlb_hit(
+        cpu.translate_address(gva, mmu::AccessType::Load),
+        0x801000,
+        1,
+    );
+}
+
+#[test]
+fn lvz_guest_second_stage_miss_exits_to_host_gcm() {
+    let mut cpu = LoongArchCpu::new();
+    let gid = 5;
+    let gva = 0x4100_0000;
+    let gpa = 0x1100_0000;
+    let fault_pc = 0x1234_5600;
+    let eentry = 0x9000_2000;
+    let ps = 12;
+    let guest_idx = mmu::mtlb_flat_index(11).unwrap();
+
+    cpu.csr_write(CSR_CRMD, 2 | CRMD_IE | CRMD_PG);
+    cpu.csr_write(CSR_PRMD, 2 | CRMD_IE);
+    cpu.csr_write(CSR_EENTRY, eentry);
+    cpu.csr_write(CSR_TLBREHI, 0xDEAD_0000_0000_002A);
+    let old_tlbrehi = cpu.csr_read(CSR_TLBREHI);
+    cpu.csr_write(CSR_GSTAT, gid << 16);
+    cpu.gcsr_write(CSR_CRMD, CRMD_PG);
+    cpu.gcsr_write(CSR_STLBPS, ps);
+    enter_guest_mode_for_test(&mut cpu);
+    write_guest_test_tlb_entry(
+        &mut cpu,
+        guest_idx,
+        gva,
+        ps as u8,
+        0x55,
+        tlbelo_test(gpa >> 12, true, true, 0, 2, false, false),
+        tlbelo_test((gpa >> 12) + 1, true, true, 0, 2, false, false),
+    );
+
+    assert_eq!(
+        cpu.translate_address_or_exception(
+            gva,
+            mmu::AccessType::Load,
+            fault_pc,
+        ),
+        Err(eentry)
+    );
+    assert_eq!(cpu.csr_read(CSR_GSTAT) & GSTAT_VM, 0);
+    assert_ne!(cpu.csr_read(CSR_GSTAT) & GSTAT_PVM, 0);
+    assert_eq!(cpu.csr_read(CSR_ERA), fault_pc);
+    assert_eq!(cpu.csr_read(CSR_PRMD), 2 | CRMD_IE);
+    assert_eq!(cpu.csr_read(CSR_BADV), gpa);
+    let estat = cpu.csr_read(CSR_ESTAT);
+    assert_eq!((estat >> 16) & 0x3F, u64::from(ECODE_GCM));
+    assert_eq!((estat >> 22) & 0x1FF, u64::from(ESUBCODE_GCHC));
+    assert_eq!(cpu.csr_read(CSR_TLBRERA) & 1, 0);
+    assert_eq!(cpu.csr_read(CSR_TLBRBADV), 0);
+    assert_eq!(cpu.csr_read(CSR_TLBREHI), old_tlbrehi);
+    assert_eq!(cpu.gcsr_read(CSR_TLBRBADV), 0);
+}
+
+#[test]
+fn task97_helper_load_stage2_miss_exits_to_host_gcm() {
+    let mut cpu = LoongArchCpu::new();
+    let gid = 6;
+    let gva = 0x4200_0000;
+    let gpa = 0x1200_0000;
+    let fault_pc = 0x1234_5800;
+    let eentry = 0x9000_3000;
+    let ps = 12;
+    let guest_idx = mmu::mtlb_flat_index(12).unwrap();
+
+    cpu.csr_write(CSR_CRMD, 2 | CRMD_IE | CRMD_PG);
+    cpu.csr_write(CSR_PRMD, 2 | CRMD_IE);
+    cpu.csr_write(CSR_EENTRY, eentry);
+    cpu.csr_write(CSR_TLBREHI, 0xDEAD_0000_0000_002A);
+    let old_tlbrehi = cpu.csr_read(CSR_TLBREHI);
+    cpu.csr_write(CSR_GSTAT, gid << 16);
+    cpu.gcsr_write(CSR_CRMD, CRMD_PG);
+    cpu.gcsr_write(CSR_STLBPS, ps);
+    enter_guest_mode_for_test(&mut cpu);
+    write_guest_test_tlb_entry(
+        &mut cpu,
+        guest_idx,
+        gva,
+        ps as u8,
+        0x56,
+        tlbelo_test(gpa >> 12, true, true, 0, 2, false, false),
+        tlbelo_test((gpa >> 12) + 1, true, true, 0, 2, false, false),
+    );
+    cpu.set_memory_fault_pending(fault_pc);
+
+    let value = unsafe { loongarch_mem_read(cpu.env_ptr(), gva, 8) };
+
+    assert_eq!(value, 0);
+    assert_eq!(cpu.pc(), eentry);
+    assert_eq!(cpu.csr_read(CSR_GSTAT) & GSTAT_VM, 0);
+    assert_ne!(cpu.csr_read(CSR_GSTAT) & GSTAT_PVM, 0);
+    assert_eq!(cpu.csr_read(CSR_ERA), fault_pc);
+    assert_eq!(cpu.csr_read(CSR_BADV), gpa);
+    let estat = cpu.csr_read(CSR_ESTAT);
+    assert_eq!((estat >> 16) & 0x3F, u64::from(ECODE_GCM));
+    assert_eq!((estat >> 22) & 0x1FF, u64::from(ESUBCODE_GCHC));
+    assert_eq!(cpu.csr_read(CSR_TLBRERA) & 1, 0);
+    assert_eq!(cpu.csr_read(CSR_TLBRBADV), 0);
+    assert_eq!(cpu.csr_read(CSR_TLBREHI), old_tlbrehi);
+    assert_eq!(cpu.gcsr_read(CSR_TLBRBADV), 0);
+}
+
+#[test]
+fn lvz_guest_lddir_ldpte_use_guest_walk_csrs_and_stage2() {
+    let mut ram = vec![0_u8; 0x8000];
+    let mut cpu = LoongArchCpu::new();
+    let gid = 9;
+    let va = 0x0000_0000_0001_5000;
+    let dir_gpa = 0x2000;
+    let pte_gpa = 0x3000;
+    let dir_hpa = 0x5000;
+    let pte_hpa = 0x6000;
+    let ps = 12;
+    let stage2_idx = mmu::mtlb_flat_index(13).unwrap();
+
+    attach_page_walk_ram(&mut cpu, &ram);
+    cpu.csr_write(CSR_CRMD, CRMD_PG);
+    cpu.csr_write(CSR_STLBPS, ps);
+    cpu.csr_write(CSR_GSTAT, gid << 16);
+    cpu.csr_write(CSR_GTLBC, (1 << 12) | (gid << 16));
+    write_test_tlb_entry(
+        &mut cpu,
+        stage2_idx,
+        dir_gpa,
+        ps as u8,
+        0,
+        tlbelo_test(dir_hpa >> 12, true, true, 0, 0, true, false),
+        tlbelo_test(pte_hpa >> 12, true, true, 0, 0, true, false),
+    );
+
+    let dir_index = (va >> 15) & 0x7;
+    let ptindex = (va >> 12) & 0x7;
+    let pair = ptindex & !1;
+    let elo0 = tlbelo_test(0xA10, true, true, 0, 1, false, false);
+    let elo1 = tlbelo_test(0xA11, true, false, 0, 2, false, false);
+    write_ram_u64(&mut ram, dir_hpa | (dir_index << 3), pte_gpa);
+    write_ram_u64(&mut ram, pte_hpa | (pair << 3), elo0);
+    write_ram_u64(&mut ram, pte_hpa | ((pair + 1) << 3), elo1);
+    attach_page_walk_ram(&mut cpu, &ram);
+
+    cpu.csr_write(CSR_PWCL, pwcl(14, 3, 20, 3, 0, 0));
+    cpu.csr_write(CSR_TLBRBADV, 0);
+    cpu.csr_write(CSR_TLBREHI, 0xDEAD_0000_0000_0000);
+    cpu.gcsr_write(CSR_PWCL, pwcl(12, 3, 15, 3, 0, 0));
+    cpu.gcsr_write(CSR_TLBRBADV, va);
+    cpu.gcsr_write(CSR_TLBREHI, va & !0x1FFF);
+    enter_guest_mode_for_test(&mut cpu);
+
+    let walked = cpu.lddir(dir_gpa, 1);
+    assert_eq!(walked, pte_gpa);
+    cpu.ldpte(walked, 0);
+    cpu.ldpte(walked, 1);
+
+    assert_eq!(cpu.gcsr_read(CSR_TLBRELO0), elo0);
+    assert_eq!(cpu.gcsr_read(CSR_TLBRELO1), elo1);
+    assert_eq!(cpu.gcsr_read(CSR_TLBREHI) & 0x3F, ps);
+    assert_eq!(cpu.csr_read(CSR_TLBRELO0), 0);
+    assert_eq!(cpu.csr_read(CSR_TLBRELO1), 0);
+}
+
+#[test]
+fn lvz_guest_timer_uses_guest_tcfg_tval_and_ticlr() {
+    let mut cpu = LoongArchCpu::new();
+    enter_guest_mode_for_test(&mut cpu);
+
+    cpu.gcsr_write(CSR_TCFG, 0x0101);
+    assert_eq!(cpu.gcsr_read(CSR_TVAL), 0x0100);
+
+    cpu.timer_tick(0x0100);
+
+    assert_ne!(cpu.gcsr_read(CSR_ESTAT) & TIMER_INTERRUPT, 0);
+    assert_eq!(cpu.csr_read(CSR_ESTAT) & TIMER_INTERRUPT, 0);
+    assert_eq!(cpu.gcsr_read(CSR_TCFG) & 1, 0);
+
+    cpu.gcsr_write(CSR_TICLR, 1);
+    assert_eq!(cpu.gcsr_read(CSR_ESTAT) & TIMER_INTERRUPT, 0);
+}
+
+#[test]
+fn lvz_guest_asid_change_flushes_fast_translation_cache() {
+    let mut cpu = LoongArchCpu::new();
+    let gva = 0x4200_0000;
+    let gpa = 0x220000;
+    let hpa = 0x400000;
+    let ps = 12;
+    let host_idx = mmu::mtlb_flat_index(14).unwrap();
+    let guest_idx = mmu::mtlb_flat_index(15).unwrap();
+
+    cpu.set_guest_base(0x10_0000_0000);
+    cpu.set_ram_base(0);
+    cpu.set_ram_end(0x800000);
+    cpu.csr_write(CSR_CRMD, CRMD_PG);
+    cpu.csr_write(CSR_STLBPS, ps);
+    write_test_tlb_entry(
+        &mut cpu,
+        host_idx,
+        gpa,
+        ps as u8,
+        0,
+        tlbelo_test(hpa >> 12, true, true, 0, 0, true, false),
+        tlbelo_test((hpa >> 12) + 1, true, true, 0, 0, true, false),
+    );
+    cpu.gcsr_write(CSR_CRMD, CRMD_PG);
+    cpu.gcsr_write(CSR_STLBPS, ps);
+    enter_guest_mode_for_test(&mut cpu);
+    write_guest_test_tlb_entry(
+        &mut cpu,
+        guest_idx,
+        gva,
+        ps as u8,
+        0x12,
+        tlbelo_test(gpa >> 12, true, true, 0, 0, false, false),
+        tlbelo_test((gpa >> 12) + 1, true, true, 0, 0, false, false),
+    );
+
+    assert_tlb_hit(
+        cpu.translate_address_and_cache(gva, mmu::AccessType::Load),
+        hpa,
+        0,
+    );
+    assert_eq!(
+        cpu.fast_tlb_lookup_addend(gva, mmu::AccessType::Load),
+        Some(expected_tlb_addend(&cpu, gva, hpa))
+    );
+
+    cpu.gcsr_write(CSR_ASID, 0x13);
+
+    assert_eq!(cpu.fast_tlb_lookup_addend(gva, mmu::AccessType::Load), None);
+    assert_eq!(
+        cpu.translate_address(gva, mmu::AccessType::Load),
+        mmu::TlbLookupResult::Miss
+    );
 }
 
 #[test]
@@ -2507,6 +3292,19 @@ fn task23_fast_tlb_layout_matches_x86_emitter_contract() {
 }
 
 #[test]
+fn task96_fast_tlb_mmio_fill_keeps_tags_invalid_for_slow_path() {
+    let mut tlb = mmu::LoongArchMmu::new();
+    let va = 0x8000_0000_1008_0005;
+    let pa = 0x1008_0005;
+    let idx = mmu::fast_tlb_index(va);
+
+    tlb.fill_fast_tlb(va, mmu::AccessType::Load, pa, mmu::FAST_TLB_MMIO_ADDEND);
+
+    assert_eq!(tlb.fast_tlb[idx].addr_read, mmu::FAST_TLB_INVALID_TAG);
+    assert_eq!(tlb.fast_tlb[idx].addend, mmu::FAST_TLB_MMIO_ADDEND);
+}
+
+#[test]
 fn task23_fast_tlb_cache_fills_and_invalidates_on_asid_change() {
     let mut cpu = LoongArchCpu::new();
     let ps = 14;
@@ -3573,6 +4371,18 @@ fn task25_translated_invtlb_invalid_opcode_raises_ine() {
     assert_eq!(cpu.pc(), 0x100);
     assert_eq!(cpu.csr_read(CSR_ERA), 0);
     assert_eq!((cpu.csr_read(CSR_ESTAT) >> 16) & 0x3F, u64::from(ECODE_INE));
+}
+
+#[test]
+fn task25_translated_lvz_invtlb_opcode_18_is_accepted() {
+    let mut cpu = LoongArchCpu::new();
+    cpu.csr_write(CSR_EENTRY, 0x100);
+
+    let _ = run_priv_la(&mut cpu, &[r3_insn(INVTLB_OP, 0, 0, 0x12)]);
+
+    assert_eq!(cpu.pc(), 4);
+    assert_eq!((cpu.csr_read(CSR_ESTAT) >> 16) & 0x3F, 0);
+    assert!(cpu.take_tb_flush());
 }
 
 #[test]

@@ -227,9 +227,12 @@ pub struct ExecEnv<B: HostCodeGen> {
 }
 
 impl<B: HostCodeGen> ExecEnv<B> {
-    pub fn new(mut backend: B) -> Self {
-        let mut code_buf =
-            CodeBuffer::new(1024 * 1024 * 1024).expect("mmap failed");
+    pub fn new(backend: B) -> Self {
+        Self::with_code_buffer_size(backend, 1024 * 1024 * 1024)
+    }
+
+    pub fn with_code_buffer_size(mut backend: B, size: usize) -> Self {
+        let mut code_buf = CodeBuffer::new(size).expect("mmap failed");
         backend.emit_prologue(&mut code_buf);
         backend.emit_epilogue(&mut code_buf);
         let code_gen_start = code_buf.offset();

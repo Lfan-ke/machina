@@ -5,6 +5,7 @@ pub struct LoongArchCfg {
     pub has_lsx: bool,
     pub has_lasx: bool,
     pub has_lbt: bool,
+    pub has_lvz: bool,
 }
 
 impl LoongArchCfg {
@@ -23,6 +24,9 @@ impl LoongArchCfg {
         if self.has_lbt {
             val |= (1 << 18) | (1 << 19) | (1 << 20);
         }
+        if self.has_lvz {
+            val |= (1 << 10) | (1 << 11);
+        }
         val
     }
 }
@@ -34,6 +38,7 @@ impl Default for LoongArchCfg {
             has_lsx: false,
             has_lasx: false,
             has_lbt: false,
+            has_lvz: true,
         }
     }
 }

@@ -47,6 +47,7 @@ fn usage() {
          (default: riscv64-ref; supports loongarch64-ref)"
     );
     eprintln!("  -m size       RAM size in MiB (default: 128)");
+    eprintln!("  -smp cpus     Number of virtual CPUs (default: 1)");
     eprintln!("  -bios path    BIOS/firmware binary");
     eprintln!(
         "  -bios builtin Boot directly in S-mode \
@@ -101,6 +102,7 @@ struct CliArgs {
     machine: String,
     ram_mib: u64,
     ram_mib_explicit: bool,
+    cpu_count: u32,
     bios: Option<PathBuf>,
     bios_builtin: bool,
     kernel: Option<PathBuf>,
@@ -128,6 +130,7 @@ impl Default for CliArgs {
             machine: "riscv64-ref".to_string(),
             ram_mib: 128,
             ram_mib_explicit: false,
+            cpu_count: 1,
             bios: None,
             bios_builtin: false,
             kernel: None,
@@ -175,6 +178,17 @@ fn parse_args() -> Result<CliArgs, String> {
                     );
                 }
                 cli.ram_mib_explicit = true;
+            }
+            "-smp" => {
+                i += 1;
+                let s = args.get(i).ok_or("-smp requires argument")?;
+                cli.cpu_count =
+                    s.parse::<u32>().map_err(|e| format!("-smp: {}", e))?;
+                if cli.cpu_count == 0 {
+                    return Err(
+                        "-smp: CPU count must be greater than 0".to_string()
+                    );
+                }
             }
             "-bios" => {
                 i += 1;
@@ -861,7 +875,7 @@ fn run_loongarch_machine_cycle(
 
     let mut cpu_mgr = CpuManager::new();
     let stop_flag = cpu_mgr.running_flag();
-    let (cpu_state, interrupts) = match machine.take_runtime_cpu_state() {
+    let cpu_states = match machine.take_runtime_cpu_states() {
         Ok(parts) => parts,
         Err(e) => {
             eprintln!("machina: runtime CPU setup failed: {}", e);
@@ -869,21 +883,23 @@ fn run_loongarch_machine_cycle(
             process::exit(1);
         }
     };
-    let cpu = unsafe {
-        // The guest-visible LoongArch RAM window starts at physical 0.
-        // VIRT_RAM_BASE is the high direct-map boot alias; DA/MMU
-        // translation canonicalizes it back to low physical RAM here.
-        LoongArchFullSystemCpu::new_with_interrupts(
-            cpu_state,
-            machine.ram_block().as_ptr(),
-            0,
-            ram_size,
-            machine.address_space() as *const _ as u64,
-            Arc::clone(&stop_flag),
-            interrupts,
-        )
-    };
-    cpu_mgr.add_loongarch_cpu(cpu);
+    for (cpu_state, interrupts) in cpu_states {
+        let cpu = unsafe {
+            // The guest-visible LoongArch RAM window starts at physical 0.
+            // VIRT_RAM_BASE is the high direct-map boot alias; DA/MMU
+            // translation canonicalizes it back to low physical RAM here.
+            LoongArchFullSystemCpu::new_with_interrupts(
+                cpu_state,
+                machine.ram_block().as_ptr(),
+                0,
+                ram_size,
+                machine.address_space() as *const _ as u64,
+                Arc::clone(&stop_flag),
+                interrupts,
+            )
+        };
+        cpu_mgr.add_loongarch_cpu(cpu);
+    }
 
     let exit = unsafe { cpu_mgr.run(&shared) };
     loongarch_shutdown_reason(exit)
@@ -992,7 +1008,7 @@ fn main() {
     let bios_builtin = cli.bios_builtin;
     let opts = MachineOpts {
         ram_size,
-        cpu_count: 1,
+        cpu_count: cli.cpu_count,
         kernel: cli.kernel.clone(),
         dtb: cli.dtb.clone(),
         bios: cli.bios.clone(),

@@ -3,11 +3,18 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Condvar, Mutex};
 
 use super::csr::{
-    ASID_WRITE_MASK, CRMD_DA, CRMD_IE, CRMD_PG, CRMD_PLV_MASK, ESTAT_IS_MASK,
+    ASID_WRITE_MASK, CRMD_DA, CRMD_IE, CRMD_PG, CRMD_PLV_MASK, CSR_ASID,
+    CSR_BADV, CSR_CRMD, CSR_DMW0, CSR_DMW1, CSR_DMW2, CSR_DMW3, CSR_ECFG,
+    CSR_EENTRY, CSR_ERA, CSR_ESTAT, CSR_PRMD, CSR_PWCH, CSR_PWCL, CSR_STLBPS,
+    CSR_TCFG, CSR_TLBEHI, CSR_TLBELO0, CSR_TLBELO1, CSR_TLBIDX, CSR_TLBRBADV,
+    CSR_TLBREHI, CSR_TLBRELO0, CSR_TLBRELO1, CSR_TLBRENTRY, CSR_TLBRERA,
+    CSR_TLBRPRMD, CSR_TVAL, ESTAT_IS_MASK, GSTAT_GID, GSTAT_GID_SHIFT,
+    GSTAT_PVM, GTLBC_TGID, GTLBC_TGID_SHIFT, GTLBC_USETGID,
 };
 use super::exception::{
-    ECODE_FPE, ECODE_PIF, ECODE_PIL, ECODE_PIS, ECODE_PME, ECODE_PNR,
-    ECODE_PNX, ECODE_PPI, ECODE_TLBR,
+    ECODE_FPE, ECODE_GCM, ECODE_GSPR, ECODE_HVC, ECODE_PIF, ECODE_PIL,
+    ECODE_PIS, ECODE_PME, ECODE_PNR, ECODE_PNX, ECODE_PPI, ECODE_TLBR,
+    ESUBCODE_GCHC,
 };
 use super::ext::LoongArchCfg;
 use super::mmu::{
@@ -20,6 +27,7 @@ pub const NUM_FPRS: usize = 32;
 pub const NUM_FCC: usize = 8;
 pub const NUM_DMW: usize = 4;
 pub const NUM_SAVE: usize = 8;
+pub const NUM_GCSR: usize = 0x184;
 const TIMER_INTERRUPT_BIT: u64 = 1 << 11;
 const ECFG_VS_SHIFT: u64 = 16;
 const ECFG_VS_MASK: u64 = 0x7;
@@ -59,6 +67,8 @@ pub struct LoongArchCpu {
     pub(crate) tlbehi: u64,
     pub(crate) tlbelo0: u64,
     pub(crate) tlbelo1: u64,
+    pub(crate) gtlbc: u64,
+    pub(crate) trgp: u64,
     pub(crate) asid: u64,
     pub(crate) pgdl: u64,
     pub(crate) pgdh: u64,
@@ -90,7 +100,13 @@ pub struct LoongArchCpu {
     pub(crate) ticlr: u64,
     pub(crate) tid: u64,
 
+    pub(crate) gstat: u64,
+    pub(crate) gcfg: u64,
+    pub(crate) gintc: u64,
+    pub(crate) gcntc: u64,
+
     pub(crate) save: [u64; NUM_SAVE],
+    pub(crate) gcsr: [u64; NUM_GCSR],
 
     pub(crate) interrupt_request: AtomicU32,
     pub(crate) halted: AtomicBool,
@@ -98,6 +114,7 @@ pub struct LoongArchCpu {
     pub(crate) last_phys_pc: u64,
 
     pub(crate) mmu: LoongArchMmu,
+    pub(crate) guest_mmu: Box<LoongArchMmu>,
 
     pub(crate) ipi_status: u64,
     pub(crate) ipi_enable: u64,
@@ -160,13 +177,20 @@ impl LoongArchCpuInterruptState {
     }
 
     #[must_use]
-    pub fn wait_for_irq_or_stop(&self, running: &AtomicBool) -> bool {
+    pub fn wait_for_irq_or_stop(
+        &self,
+        running: &AtomicBool,
+        run_gate: Option<&AtomicBool>,
+    ) -> bool {
         let mut guard = self.wait_lock.lock().unwrap();
         loop {
             if self.has_pending_irq() {
                 return true;
             }
             if !running.load(Ordering::Acquire) {
+                return false;
+            }
+            if run_gate.is_some_and(|gate| !gate.load(Ordering::Acquire)) {
                 return false;
             }
             guard = self.wait_cv.wait(guard).unwrap();
@@ -353,6 +377,19 @@ impl IocsrDispatcher {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TranslationFault {
+    addr: u64,
+    fault: TlbLookupResult,
+    host_stage: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TranslationOutcome {
+    Hit { pa: u64, mat: u8 },
+    Fault(TranslationFault),
+}
+
 impl LoongArchCpu {
     #[must_use]
     pub fn new() -> Self {
@@ -361,6 +398,7 @@ impl LoongArchCpu {
             has_lsx: false,
             has_lasx: false,
             has_lbt: false,
+            has_lvz: true,
         })
     }
 
@@ -390,6 +428,12 @@ impl LoongArchCpu {
 
     #[must_use]
     pub fn with_cfg(cfg: LoongArchCfg) -> Self {
+        let mut gcsr = [0; NUM_GCSR];
+        gcsr[super::csr::CSR_CRMD as usize] = 0x0000_0008;
+        gcsr[super::csr::CSR_PRCFG1 as usize] = 0x72F8;
+        gcsr[super::csr::CSR_PRCFG2 as usize] = 0x4020_5000;
+        gcsr[super::csr::CSR_PRCFG3 as usize] = 0x0080_73F2;
+
         Self {
             gpr: [0; NUM_GPRS],
             pc: 0,
@@ -410,6 +454,8 @@ impl LoongArchCpu {
             tlbehi: 0,
             tlbelo0: 0,
             tlbelo1: 0,
+            gtlbc: 0,
+            trgp: 0,
             asid: 0,
             pgdl: 0,
             pgdh: 0,
@@ -439,12 +485,18 @@ impl LoongArchCpu {
             cntc: 0,
             ticlr: 0,
             tid: 0,
+            gstat: 0,
+            gcfg: 0,
+            gintc: 0,
+            gcntc: 0,
             save: [0; NUM_SAVE],
+            gcsr,
             interrupt_request: AtomicU32::new(0),
             halted: AtomicBool::new(false),
             neg_align: 0,
             last_phys_pc: 0,
             mmu: LoongArchMmu::new(),
+            guest_mmu: Box::new(LoongArchMmu::new()),
             ipi_status: 0,
             ipi_enable: 0,
             ipi_mailbox: [0; 4],
@@ -502,6 +554,46 @@ impl LoongArchCpu {
 
     pub fn set_cpuid(&mut self, cpuid: u64) {
         self.cpuid = cpuid;
+    }
+
+    #[must_use]
+    pub fn in_guest_mode(&self) -> bool {
+        self.gstat & super::csr::GSTAT_VM != 0
+    }
+
+    fn guest_gid(&self) -> u8 {
+        ((self.gstat & GSTAT_GID) >> GSTAT_GID_SHIFT) as u8
+    }
+
+    fn will_return_to_guest(&self) -> bool {
+        self.cfg.has_lvz && !self.in_guest_mode() && self.gstat & GSTAT_PVM != 0
+    }
+
+    fn target_gid(&self) -> u8 {
+        if self.in_guest_mode() {
+            return self.guest_gid();
+        }
+        if self.gtlbc & GTLBC_USETGID != 0 {
+            return ((self.gtlbc & GTLBC_TGID) >> GTLBC_TGID_SHIFT) as u8;
+        }
+        if self.will_return_to_guest() {
+            return self.guest_gid();
+        }
+        0
+    }
+
+    pub(crate) fn enter_guest_mode(&mut self) {
+        self.gstat =
+            (self.gstat | super::csr::GSTAT_VM) & !super::csr::GSTAT_PVM;
+        self.flush_fast_tlb();
+    }
+
+    pub(crate) fn leave_guest_mode_for_exception(&mut self) {
+        if self.in_guest_mode() {
+            self.gstat =
+                (self.gstat | super::csr::GSTAT_PVM) & !super::csr::GSTAT_VM;
+            self.flush_fast_tlb();
+        }
     }
 
     pub fn set_iocsr_dispatcher(&mut self, dispatcher: IocsrDispatcher) {
@@ -584,11 +676,22 @@ impl LoongArchCpu {
 
     #[must_use]
     pub fn masked_interrupt_line(&self) -> Option<u32> {
-        self.masked_interrupt_line_for_estat(self.estat)
+        if self.in_guest_mode() {
+            self.masked_interrupt_line_for(
+                self.gcsr[CSR_ESTAT as usize],
+                self.gcsr[CSR_ECFG as usize],
+            )
+        } else {
+            self.masked_interrupt_line_for_estat(self.estat)
+        }
     }
 
     fn masked_interrupt_line_for_estat(&self, estat: u64) -> Option<u32> {
-        let pending = estat & self.ecfg & ESTAT_IS_MASK;
+        self.masked_interrupt_line_for(estat, self.ecfg)
+    }
+
+    fn masked_interrupt_line_for(&self, estat: u64, ecfg: u64) -> Option<u32> {
+        let pending = estat & ecfg & ESTAT_IS_MASK;
         if pending == 0 {
             None
         } else {
@@ -598,6 +701,12 @@ impl LoongArchCpu {
 
     #[must_use]
     pub fn pending_interrupt_line(&self) -> Option<u32> {
+        if self.in_guest_mode() {
+            if self.gcsr[CSR_CRMD as usize] & CRMD_IE == 0 {
+                return None;
+            }
+            return self.masked_interrupt_line();
+        }
         if self.crmd & CRMD_IE == 0 {
             return None;
         }
@@ -615,11 +724,16 @@ impl LoongArchCpu {
         irq: u32,
         default_vector: u64,
     ) -> u64 {
-        let vs = (self.ecfg >> ECFG_VS_SHIFT) & ECFG_VS_MASK;
+        let (ecfg, eentry) = if self.in_guest_mode() {
+            (self.gcsr[CSR_ECFG as usize], self.gcsr[CSR_EENTRY as usize])
+        } else {
+            (self.ecfg, self.eentry)
+        };
+        let vs = (ecfg >> ECFG_VS_SHIFT) & ECFG_VS_MASK;
         if vs == 0 {
             default_vector
         } else {
-            self.eentry.wrapping_add(
+            eentry.wrapping_add(
                 u64::from(EXCCODE_EXTERNAL_INT + irq) * ((1_u64 << vs) * 4),
             )
         }
@@ -675,25 +789,153 @@ impl LoongArchCpu {
         &mut self.mmu
     }
 
+    fn active_translation_asid(&self) -> u16 {
+        if self.in_guest_mode() {
+            (self.gcsr[CSR_ASID as usize] & 0x3FF) as u16
+        } else {
+            (self.asid & 0x3FF) as u16
+        }
+    }
+
+    fn active_translation_stlbps(&self) -> u8 {
+        if self.in_guest_mode() {
+            self.gcsr[CSR_STLBPS as usize] as u8
+        } else {
+            self.stlbps as u8
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn lookup_address_with(
+        &self,
+        va: u64,
+        access: AccessType,
+        crmd: u64,
+        dmw: &[u64; NUM_DMW],
+        mmu: &LoongArchMmu,
+        asid: u16,
+        gid: u8,
+        stlb_ps: u8,
+        plv: u8,
+    ) -> TlbLookupResult {
+        if let Some(pa) = mmu::direct_map_address_with(crmd, dmw, va) {
+            return TlbLookupResult::Hit { pa, mat: 0 };
+        }
+        if crmd & super::csr::CRMD_PG == 0 {
+            return TlbLookupResult::Miss;
+        }
+        mmu.tlb_lookup(va, asid, gid, stlb_ps, access, plv)
+    }
+
+    fn translate_host_address(
+        &self,
+        va: u64,
+        access: AccessType,
+    ) -> TlbLookupResult {
+        self.lookup_address_with(
+            va,
+            access,
+            self.crmd,
+            &self.dmw,
+            &self.mmu,
+            (self.asid & 0x3FF) as u16,
+            self.target_gid(),
+            self.stlbps as u8,
+            (self.crmd & CRMD_PLV_MASK) as u8,
+        )
+    }
+
+    fn translate_guest_first_stage(
+        &self,
+        va: u64,
+        access: AccessType,
+    ) -> TlbLookupResult {
+        let dmw = [
+            self.gcsr[CSR_DMW0 as usize],
+            self.gcsr[CSR_DMW1 as usize],
+            self.gcsr[CSR_DMW2 as usize],
+            self.gcsr[CSR_DMW3 as usize],
+        ];
+        self.lookup_address_with(
+            va,
+            access,
+            self.gcsr[CSR_CRMD as usize],
+            &dmw,
+            &self.guest_mmu,
+            (self.gcsr[CSR_ASID as usize] & 0x3FF) as u16,
+            self.target_gid(),
+            self.gcsr[CSR_STLBPS as usize] as u8,
+            (self.gcsr[CSR_CRMD as usize] & CRMD_PLV_MASK) as u8,
+        )
+    }
+
+    fn translate_guest_host_stage(
+        &self,
+        gpa: u64,
+        access: AccessType,
+    ) -> TlbLookupResult {
+        self.mmu.tlb_lookup(
+            gpa,
+            (self.asid & 0x3FF) as u16,
+            self.target_gid(),
+            self.stlbps as u8,
+            access,
+            0,
+        )
+    }
+
+    fn translate_address_detail(
+        &self,
+        va: u64,
+        access: AccessType,
+    ) -> TranslationOutcome {
+        if !self.in_guest_mode() {
+            return match self.translate_host_address(va, access) {
+                TlbLookupResult::Hit { pa, mat } => {
+                    TranslationOutcome::Hit { pa, mat }
+                }
+                fault => TranslationOutcome::Fault(TranslationFault {
+                    addr: va,
+                    fault,
+                    host_stage: false,
+                }),
+            };
+        }
+
+        let gpa = match self.translate_guest_first_stage(va, access) {
+            TlbLookupResult::Hit { pa, .. } => pa,
+            fault => {
+                return TranslationOutcome::Fault(TranslationFault {
+                    addr: va,
+                    fault,
+                    host_stage: false,
+                });
+            }
+        };
+        match self.translate_guest_host_stage(gpa, access) {
+            TlbLookupResult::Hit { pa, mat } => {
+                TranslationOutcome::Hit { pa, mat }
+            }
+            fault => TranslationOutcome::Fault(TranslationFault {
+                addr: gpa,
+                fault,
+                host_stage: true,
+            }),
+        }
+    }
+
     #[must_use]
     pub fn translate_address(
         &self,
         va: u64,
         access: AccessType,
     ) -> TlbLookupResult {
-        if let Some(pa) = mmu::direct_map_address(self, va) {
-            return TlbLookupResult::Hit { pa, mat: 0 };
+        match self.translate_address_detail(va, access) {
+            TranslationOutcome::Hit { pa, mat } => {
+                TlbLookupResult::Hit { pa, mat }
+            }
+            TranslationOutcome::Fault(fault) => fault.fault,
         }
-        if self.crmd & super::csr::CRMD_PG == 0 {
-            return TlbLookupResult::Miss;
-        }
-        self.mmu.tlb_lookup(
-            va,
-            (self.asid & 0x3FF) as u16,
-            self.stlbps as u8,
-            access,
-            (self.crmd & super::csr::CRMD_PLV_MASK) as u8,
-        )
     }
 
     pub fn translate_address_and_cache(
@@ -701,12 +943,25 @@ impl LoongArchCpu {
         va: u64,
         access: AccessType,
     ) -> TlbLookupResult {
-        let result = self.translate_address(va, access);
-        if let TlbLookupResult::Hit { pa, .. } = result {
-            let addend = self.fast_tlb_addend(va, pa);
-            self.mmu.fill_fast_tlb(va, access, pa, addend);
+        match self.translate_address_detail(va, access) {
+            TranslationOutcome::Hit { pa, mat } => {
+                let addend = self.fast_tlb_addend(va, pa);
+                self.fill_fast_tlb_for_translation(va, access, pa, addend);
+                TlbLookupResult::Hit { pa, mat }
+            }
+            TranslationOutcome::Fault(fault) => fault.fault,
         }
-        result
+    }
+
+    pub fn fill_fast_tlb_for_translation(
+        &mut self,
+        va: u64,
+        access: AccessType,
+        pa: u64,
+        addend: usize,
+    ) {
+        self.active_tlb_mmu_mut()
+            .fill_fast_tlb(va, access, pa, addend);
     }
 
     pub fn translate_address_or_exception(
@@ -715,11 +970,16 @@ impl LoongArchCpu {
         access: AccessType,
         fault_pc: u64,
     ) -> Result<u64, u64> {
-        match self.translate_address(va, access) {
-            TlbLookupResult::Hit { pa, .. } => Ok(pa),
-            fault => Err(self.enter_address_translation_exception(
-                va, access, fault, fault_pc,
-            )),
+        match self.translate_address_detail(va, access) {
+            TranslationOutcome::Hit { pa, .. } => Ok(pa),
+            TranslationOutcome::Fault(fault) => Err(self
+                .enter_address_translation_exception_for_stage(
+                    fault.addr,
+                    access,
+                    fault.fault,
+                    fault_pc,
+                    fault.host_stage,
+                )),
         }
     }
 
@@ -730,8 +990,35 @@ impl LoongArchCpu {
         fault: TlbLookupResult,
         fault_pc: u64,
     ) -> u64 {
+        self.enter_address_translation_exception_for_stage(
+            va, access, fault, fault_pc, false,
+        )
+    }
+
+    fn enter_address_translation_exception_for_stage(
+        &mut self,
+        va: u64,
+        access: AccessType,
+        fault: TlbLookupResult,
+        fault_pc: u64,
+        host_stage: bool,
+    ) -> u64 {
         self.pc = fault_pc;
-        if fault == TlbLookupResult::Miss {
+        if host_stage && self.in_guest_mode() {
+            return self.enter_exception(
+                u64::from(ECODE_GCM),
+                u64::from(ESUBCODE_GCHC),
+                Some(va),
+            );
+        }
+        if self.in_guest_mode() {
+            if fault == TlbLookupResult::Miss {
+                let idx = CSR_TLBREHI as usize;
+                self.gcsr[idx] = (self.gcsr[idx] & 0x3F) | (va & !0x1FFF);
+            } else {
+                self.gcsr[CSR_TLBEHI as usize] = va & !0x1FFF;
+            }
+        } else if fault == TlbLookupResult::Miss {
             self.tlbrehi = (self.tlbrehi & 0x3F) | (va & !0x1FFF);
         } else {
             self.tlbehi = va & !0x1FFF;
@@ -759,6 +1046,10 @@ impl LoongArchCpu {
         badv: Option<u64>,
     ) -> u64 {
         let pc = self.pc;
+        if self.in_guest_mode() && !Self::exception_exits_guest(ecode) {
+            return self.enter_guest_exception(ecode, esubcode, badv, pc);
+        }
+        self.leave_guest_mode_for_exception();
         if ecode == u64::from(ECODE_TLBR) {
             self.tlbrera = (pc & !0x3) | 1;
             self.tlbrprmd = self.crmd & 0x7;
@@ -783,6 +1074,45 @@ impl LoongArchCpu {
         self.exception_vector(ecode)
     }
 
+    const fn exception_exits_guest(ecode: u64) -> bool {
+        matches!(ecode as u32, ECODE_GSPR | ECODE_HVC | ECODE_GCM)
+    }
+
+    fn enter_guest_exception(
+        &mut self,
+        ecode: u64,
+        esubcode: u64,
+        badv: Option<u64>,
+        pc: u64,
+    ) -> u64 {
+        if ecode == u64::from(ECODE_TLBR) {
+            self.gcsr[CSR_TLBRERA as usize] = (pc & !0x3) | 1;
+            self.gcsr[CSR_TLBRPRMD as usize] =
+                self.gcsr[CSR_CRMD as usize] & 0x7;
+            if let Some(badv) = badv {
+                self.gcsr[CSR_TLBRBADV as usize] = badv;
+            }
+            self.gcsr[CSR_CRMD as usize] = (self.gcsr[CSR_CRMD as usize]
+                & !CRMD_PLV_MASK
+                & !CRMD_IE
+                & !CRMD_PG)
+                | CRMD_DA;
+            return self.gcsr[CSR_TLBRENTRY as usize];
+        }
+
+        self.gcsr[CSR_ERA as usize] = pc;
+        self.gcsr[CSR_PRMD as usize] = self.gcsr[CSR_CRMD as usize] & 0x7;
+        if let Some(badv) = badv {
+            self.gcsr[CSR_BADV as usize] = badv;
+        }
+        self.gcsr[CSR_CRMD as usize] &= !CRMD_PLV_MASK & !CRMD_IE;
+        self.gcsr[CSR_ESTAT as usize] = (self.gcsr[CSR_ESTAT as usize]
+            & ESTAT_IS_MASK)
+            | ((ecode & 0x3F) << 16)
+            | ((esubcode & 0x1FF) << 22);
+        self.guest_exception_vector(ecode)
+    }
+
     fn exception_vector(&self, ecode: u64) -> u64 {
         if ecode == u64::from(ECODE_TLBR) {
             return self.tlbrentry;
@@ -797,17 +1127,32 @@ impl LoongArchCpu {
         }
     }
 
+    fn guest_exception_vector(&self, ecode: u64) -> u64 {
+        if ecode == u64::from(ECODE_TLBR) {
+            return self.gcsr[CSR_TLBRENTRY as usize];
+        }
+
+        let vs = (self.gcsr[CSR_ECFG as usize] >> ECFG_VS_SHIFT) & ECFG_VS_MASK;
+        if vs == 0 {
+            self.gcsr[CSR_EENTRY as usize]
+        } else {
+            self.gcsr[CSR_EENTRY as usize]
+                .wrapping_add((ecode & 0x3F).wrapping_mul((1_u64 << vs) * 4))
+        }
+    }
+
     #[must_use]
     pub fn fast_tlb_lookup_addend(
         &self,
         va: u64,
         access: AccessType,
     ) -> Option<usize> {
-        self.mmu.fast_tlb_lookup_addend(va, access)
+        self.active_tlb_mmu().fast_tlb_lookup_addend(va, access)
     }
 
     pub(crate) fn flush_fast_tlb(&mut self) {
         self.mmu.flush_fast_tlb();
+        self.guest_mmu.flush_fast_tlb();
     }
 
     pub(crate) fn invalidate_tlb_translations(&mut self) {
@@ -830,28 +1175,188 @@ impl LoongArchCpu {
         }
     }
 
+    fn active_tlb_mmu(&self) -> &LoongArchMmu {
+        if self.in_guest_mode() {
+            &self.guest_mmu
+        } else {
+            &self.mmu
+        }
+    }
+
+    fn active_tlb_mmu_mut(&mut self) -> &mut LoongArchMmu {
+        if self.in_guest_mode() {
+            &mut self.guest_mmu
+        } else {
+            &mut self.mmu
+        }
+    }
+
+    fn active_tlbidx(&self) -> u64 {
+        if self.in_guest_mode() {
+            self.gcsr[CSR_TLBIDX as usize]
+        } else {
+            self.tlbidx
+        }
+    }
+
+    fn set_active_tlbidx(&mut self, val: u64) {
+        if self.in_guest_mode() {
+            self.gcsr[CSR_TLBIDX as usize] = val;
+        } else {
+            self.tlbidx = val;
+        }
+    }
+
+    fn active_tlbehi(&self) -> u64 {
+        if self.in_guest_mode() {
+            self.gcsr[CSR_TLBEHI as usize]
+        } else {
+            self.tlbehi
+        }
+    }
+
+    fn set_active_tlbehi(&mut self, val: u64) {
+        if self.in_guest_mode() {
+            self.gcsr[CSR_TLBEHI as usize] = val;
+        } else {
+            self.tlbehi = val;
+        }
+    }
+
+    fn set_active_tlbelo0(&mut self, val: u64) {
+        if self.in_guest_mode() {
+            self.gcsr[CSR_TLBELO0 as usize] = val;
+        } else {
+            self.tlbelo0 = val;
+        }
+    }
+
+    fn set_active_tlbelo1(&mut self, val: u64) {
+        if self.in_guest_mode() {
+            self.gcsr[CSR_TLBELO1 as usize] = val;
+        } else {
+            self.tlbelo1 = val;
+        }
+    }
+
+    fn active_tlbrera(&self) -> u64 {
+        if self.in_guest_mode() {
+            self.gcsr[CSR_TLBRERA as usize]
+        } else {
+            self.tlbrera
+        }
+    }
+
+    fn active_tlbrbadv(&self) -> u64 {
+        if self.in_guest_mode() {
+            self.gcsr[CSR_TLBRBADV as usize]
+        } else {
+            self.tlbrbadv
+        }
+    }
+
+    fn active_tlbrehi(&self) -> u64 {
+        if self.in_guest_mode() {
+            self.gcsr[CSR_TLBREHI as usize]
+        } else {
+            self.tlbrehi
+        }
+    }
+
+    fn set_active_tlbrehi(&mut self, val: u64) {
+        if self.in_guest_mode() {
+            self.gcsr[CSR_TLBREHI as usize] = val;
+        } else {
+            self.tlbrehi = val;
+        }
+    }
+
+    fn active_tlbrelo0(&self) -> u64 {
+        if self.in_guest_mode() {
+            self.gcsr[CSR_TLBRELO0 as usize]
+        } else {
+            self.tlbrelo0
+        }
+    }
+
+    fn set_active_tlbrelo0(&mut self, val: u64) {
+        if self.in_guest_mode() {
+            self.gcsr[CSR_TLBRELO0 as usize] = val;
+        } else {
+            self.tlbrelo0 = val;
+        }
+    }
+
+    fn active_tlbrelo1(&self) -> u64 {
+        if self.in_guest_mode() {
+            self.gcsr[CSR_TLBRELO1 as usize]
+        } else {
+            self.tlbrelo1
+        }
+    }
+
+    fn set_active_tlbrelo1(&mut self, val: u64) {
+        if self.in_guest_mode() {
+            self.gcsr[CSR_TLBRELO1 as usize] = val;
+        } else {
+            self.tlbrelo1 = val;
+        }
+    }
+
+    fn active_tlbelo0(&self) -> u64 {
+        if self.in_guest_mode() {
+            self.gcsr[CSR_TLBELO0 as usize]
+        } else {
+            self.tlbelo0
+        }
+    }
+
+    fn active_tlbelo1(&self) -> u64 {
+        if self.in_guest_mode() {
+            self.gcsr[CSR_TLBELO1 as usize]
+        } else {
+            self.tlbelo1
+        }
+    }
+
+    fn active_asid_low(&self) -> u16 {
+        self.active_translation_asid()
+    }
+
+    fn set_active_asid_low(&mut self, asid: u64) {
+        if self.in_guest_mode() {
+            self.gcsr[CSR_ASID as usize] = (self.gcsr[CSR_ASID as usize]
+                & !ASID_WRITE_MASK)
+                | (asid & ASID_WRITE_MASK);
+        } else {
+            self.set_asid_low(asid);
+        }
+    }
+
     pub fn tlb_search(&self) -> Option<usize> {
         use super::mmu::{
             mtlb_flat_index, stlb_flat_index, stlb_set_index, MTLB_SIZE,
             STLB_WAYS,
         };
-        let entryhi = if self.tlbrera & 1 != 0 {
-            self.tlbrehi
+        let entryhi = if self.active_tlbrera() & 1 != 0 {
+            self.active_tlbrehi()
         } else {
-            self.tlbehi
+            self.active_tlbehi()
         };
-        let asid = (self.asid & 0x3FF) as u16;
-        let ps = self.stlbps as u8;
+        let asid = self.active_asid_low();
+        let gid = self.target_gid();
+        let ps = self.active_translation_stlbps();
+        let mmu = self.active_tlb_mmu();
         for i in 0..MTLB_SIZE {
-            let e = &self.mmu.mtlb[i];
-            if Self::tlb_entry_matches_va(e, entryhi, asid) {
+            let e = &mmu.mtlb[i];
+            if Self::tlb_entry_matches_va(e, entryhi, asid, gid) {
                 return mtlb_flat_index(i);
             }
         }
         if let Some(set_idx) = stlb_set_index(entryhi, ps) {
             for w in 0..STLB_WAYS {
-                let e = &self.mmu.stlb[set_idx][w];
-                if Self::tlb_entry_matches_va(e, entryhi, asid) {
+                let e = &mmu.stlb[set_idx][w];
+                if Self::tlb_entry_matches_va(e, entryhi, asid, gid) {
                     return stlb_flat_index(set_idx, w);
                 }
             }
@@ -859,12 +1364,25 @@ impl LoongArchCpu {
         None
     }
 
+    pub fn tlb_search_and_update(&mut self) {
+        if let Some(idx) = self.tlb_search() {
+            let tlbidx = self.active_tlbidx();
+            self.set_active_tlbidx(
+                (tlbidx & !(0xFFF | (1 << 31))) | idx as u64,
+            );
+        } else {
+            self.set_active_tlbidx(self.active_tlbidx() | (1 << 31));
+        }
+    }
+
     fn tlb_entry_matches_va(
         entry: &super::mmu::TlbEntry,
         va: u64,
         asid: u16,
+        gid: u8,
     ) -> bool {
-        if !entry.valid || (!entry.g && entry.asid != asid) {
+        if !entry.valid || entry.gid != gid || (!entry.g && entry.asid != asid)
+        {
             return false;
         }
         let ps = u32::from(entry.page_size);
@@ -877,12 +1395,22 @@ impl LoongArchCpu {
     }
 
     fn page_walk_dir_base_width(&self, level: u64) -> (u64, u64) {
+        let pwcl = if self.in_guest_mode() {
+            self.gcsr[CSR_PWCL as usize]
+        } else {
+            self.pwcl
+        };
+        let pwch = if self.in_guest_mode() {
+            self.gcsr[CSR_PWCH as usize]
+        } else {
+            self.pwch
+        };
         match level {
-            1 => ((self.pwcl >> 10) & 0x1F, (self.pwcl >> 15) & 0x1F),
-            2 => ((self.pwcl >> 20) & 0x1F, (self.pwcl >> 25) & 0x1F),
-            3 => (self.pwch & 0x3F, (self.pwch >> 6) & 0x3F),
-            4 => ((self.pwch >> 12) & 0x3F, (self.pwch >> 18) & 0x3F),
-            _ => (self.pwcl & 0x1F, (self.pwcl >> 5) & 0x1F),
+            1 => ((pwcl >> 10) & 0x1F, (pwcl >> 15) & 0x1F),
+            2 => ((pwcl >> 20) & 0x1F, (pwcl >> 25) & 0x1F),
+            3 => (pwch & 0x3F, (pwch >> 6) & 0x3F),
+            4 => ((pwch >> 12) & 0x3F, (pwch >> 18) & 0x3F),
+            _ => (pwcl & 0x1F, (pwcl >> 5) & 0x1F),
         }
     }
 
@@ -898,6 +1426,18 @@ impl LoongArchCpu {
         let ptr = (self.guest_base + pa) as *const u64;
         // SAFETY: bounds were checked against the RAM window above.
         unsafe { ptr.read_unaligned() }
+    }
+
+    fn read_page_walk_u64(&self, gpa: u64) -> u64 {
+        let pa = if self.in_guest_mode() {
+            match self.translate_guest_host_stage(gpa, AccessType::Load) {
+                TlbLookupResult::Hit { pa, .. } => pa,
+                _ => return 0,
+            }
+        } else {
+            gpa
+        };
+        self.read_phys_u64(pa)
     }
 
     fn sanitize_page_walk_pte(&self, pte: u64) -> u64 {
@@ -919,14 +1459,14 @@ impl LoongArchCpu {
                 | ((level & TLBENTRY_LEVEL_MASK) << TLBENTRY_LEVEL_SHIFT);
         }
 
-        let badv = self.tlbrbadv;
+        let badv = self.active_tlbrbadv();
         let (dir_base, dir_width) = self.page_walk_dir_base_width(level);
         if dir_width == 0 || dir_width >= 64 {
             return 0;
         }
         let index = (badv >> dir_base) & ((1_u64 << dir_width) - 1);
         let phys = (base & super::mmu::TARGET_VIRT_MASK) | (index << 3);
-        self.read_phys_u64(phys) & super::mmu::TARGET_VIRT_MASK
+        self.read_page_walk_u64(phys) & super::mmu::TARGET_VIRT_MASK
     }
 
     pub fn ldpte(&mut self, base: u64, odd: u64) {
@@ -948,85 +1488,100 @@ impl LoongArchCpu {
                 huge
             });
         } else {
-            let ptbase = self.pwcl & 0x1F;
-            let ptwidth = (self.pwcl >> 5) & 0x1F;
+            let pwcl = if self.in_guest_mode() {
+                self.gcsr[CSR_PWCL as usize]
+            } else {
+                self.pwcl
+            };
+            let ptbase = pwcl & 0x1F;
+            let ptwidth = (pwcl >> 5) & 0x1F;
             if ptwidth == 0 || ptwidth >= 64 {
                 return;
             }
-            let badv = self.tlbrbadv;
+            let badv = self.active_tlbrbadv();
             let ptindex = ((badv >> ptbase) & ((1_u64 << ptwidth) - 1)) & !1;
             let offset = if odd != 0 { ptindex + 1 } else { ptindex } << 3;
             let phys = (base & super::mmu::TARGET_VIRT_MASK) | offset;
-            tmp = self.sanitize_page_walk_pte(self.read_phys_u64(phys));
+            tmp = self.sanitize_page_walk_pte(self.read_page_walk_u64(phys));
             ps = ptbase;
         }
 
         if odd != 0 {
-            self.tlbrelo1 = tmp;
+            self.set_active_tlbrelo1(tmp);
         } else {
-            self.tlbrelo0 = tmp;
+            self.set_active_tlbrelo0(tmp);
         }
-        self.tlbrehi = (self.tlbrehi & !0x3F) | (ps & 0x3F);
+        self.set_active_tlbrehi((self.active_tlbrehi() & !0x3F) | (ps & 0x3F));
     }
 
     pub fn tlb_read(&mut self, idx: usize) {
-        let Some(e) = self.mmu.entry(idx).copied() else {
+        let Some(e) = self.active_tlb_mmu().entry(idx).copied() else {
             self.read_invalid_tlb_entry();
             return;
         };
-        if !e.valid {
+        if !e.valid || (self.in_guest_mode() && e.gid != self.target_gid()) {
             self.read_invalid_tlb_entry();
             return;
         }
-        self.tlbidx = (self.tlbidx & !(1 << 31 | 0x3F << 24 | 0xFFF))
-            | ((u64::from(e.page_size)) << 24)
-            | (idx as u64 & 0xFFF);
-        self.tlbehi = e.vppn << 13;
-        self.tlbelo0 = self.encode_tlbelo(
+        let tlbidx = self.active_tlbidx();
+        self.set_active_tlbidx(
+            (tlbidx & !(1 << 31 | 0x3F << 24 | 0xFFF))
+                | ((u64::from(e.page_size)) << 24)
+                | (idx as u64 & 0xFFF),
+        );
+        self.set_active_tlbehi(e.vppn << 13);
+        let tlbelo0 = self.encode_tlbelo(
             e.ppn0, e.v0, e.d0, e.plv0, e.mat0, e.g, e.nr0, e.nx0, e.rplv0,
         );
-        self.tlbelo1 = self.encode_tlbelo(
+        let tlbelo1 = self.encode_tlbelo(
             e.ppn1, e.v1, e.d1, e.plv1, e.mat1, e.g, e.nr1, e.nx1, e.rplv1,
         );
-        self.set_asid_low(u64::from(e.asid));
+        self.set_active_tlbelo0(tlbelo0);
+        self.set_active_tlbelo1(tlbelo1);
+        self.set_active_asid_low(u64::from(e.asid));
     }
 
     fn read_invalid_tlb_entry(&mut self) {
-        self.tlbidx = (self.tlbidx & !(0x3F << 24)) | (1 << 31);
-        self.tlbehi = 0;
-        self.tlbelo0 = 0;
-        self.tlbelo1 = 0;
-        self.set_asid_low(0);
+        self.set_active_tlbidx(
+            (self.active_tlbidx() & !(0x3F << 24)) | (1 << 31),
+        );
+        self.set_active_tlbehi(0);
+        self.set_active_tlbelo0(0);
+        self.set_active_tlbelo1(0);
+        self.set_active_asid_low(0);
     }
 
     pub fn tlb_write(&mut self, idx: usize) {
-        if self.tlbidx & (1 << 31) != 0 {
-            if self.mmu.write_entry(idx, super::mmu::TlbEntry::default()) {
+        if self.active_tlbidx() & (1 << 31) != 0 {
+            if self
+                .active_tlb_mmu_mut()
+                .write_entry(idx, super::mmu::TlbEntry::default())
+            {
                 self.invalidate_tlb_translations();
             }
             return;
         }
         let (entryhi, elo0, elo1, ps) = self.tlb_entry_source_csrs();
         let entry = self.tlb_entry_from_csrs(entryhi, elo0, elo1, ps);
-        if self.mmu.write_entry(idx, entry) {
+        if self.active_tlb_mmu_mut().write_entry(idx, entry) {
             self.invalidate_tlb_translations();
         }
     }
 
     fn tlb_entry_source_csrs(&self) -> (u64, u64, u64, u8) {
-        if self.tlbrera & 1 != 0 {
+        if self.active_tlbrera() & 1 != 0 {
             (
-                self.tlbrehi,
-                self.tlbrelo0,
-                self.tlbrelo1,
-                (self.tlbrehi & 0x3F) as u8,
+                self.active_tlbrehi(),
+                self.active_tlbrelo0(),
+                self.active_tlbrelo1(),
+                (self.active_tlbrehi() & 0x3F) as u8,
             )
         } else {
             (
-                self.tlbehi,
-                self.tlbelo0,
-                self.tlbelo1,
-                ((self.tlbidx >> 24) & 0x3F) as u8,
+                self.active_tlbehi(),
+                self.active_tlbelo0(),
+                self.active_tlbelo1(),
+                ((self.active_tlbidx() >> 24) & 0x3F) as u8,
             )
         }
     }
@@ -1041,7 +1596,8 @@ impl LoongArchCpu {
         super::mmu::TlbEntry {
             vppn: entryhi >> 13,
             page_size: ps,
-            asid: (self.asid & 0x3FF) as u16,
+            asid: self.active_asid_low(),
+            gid: self.target_gid(),
             g: (elo0 & elo1 & (1 << 6)) != 0,
             valid: true,
             ppn0: (elo0 >> 12) & 0xF_FFFF_FFFF,
@@ -1069,14 +1625,14 @@ impl LoongArchCpu {
         };
         let (entryhi, elo0, elo1, ps) = self.tlb_entry_source_csrs();
         let entry = self.tlb_entry_from_csrs(entryhi, elo0, elo1, ps);
-        let idx = if ps == self.stlbps as u8 {
+        let idx = if ps == self.active_translation_stlbps() {
             stlb_set_index(entryhi, ps).and_then(|set| stlb_flat_index(set, 0))
         } else {
-            let raw_idx = (self.tlbidx as usize) & (MTLB_SIZE - 1);
+            let raw_idx = (self.active_tlbidx() as usize) & (MTLB_SIZE - 1);
             mtlb_flat_index(raw_idx)
         };
         if let Some(idx) = idx {
-            if self.mmu.write_entry(idx, entry) {
+            if self.active_tlb_mmu_mut().write_entry(idx, entry) {
                 self.invalidate_tlb_translations();
             }
         }
@@ -1085,18 +1641,20 @@ impl LoongArchCpu {
     pub fn tlb_clear_by_index(&mut self) {
         use super::mmu::{STLB_SETS, STLB_SIZE, TLB_TOTAL_SIZE};
 
-        let idx = (self.tlbidx & 0xFFF) as usize;
-        let asid = (self.asid & 0x3FF) as u16;
+        let idx = (self.active_tlbidx() & 0xFFF) as usize;
+        let asid = self.active_asid_low();
+        let gid = self.target_gid();
+        let mmu = self.active_tlb_mmu_mut();
         if idx < STLB_SIZE {
             let set = idx % STLB_SETS;
-            self.mmu.stlb[set].iter_mut().for_each(|e| {
-                if e.valid && !e.g && e.asid == asid {
+            mmu.stlb[set].iter_mut().for_each(|e| {
+                if e.valid && e.gid == gid && !e.g && e.asid == asid {
                     e.valid = false;
                 }
             });
         } else if idx < TLB_TOTAL_SIZE {
-            self.mmu.mtlb.iter_mut().for_each(|e| {
-                if e.valid && !e.g && e.asid == asid {
+            mmu.mtlb.iter_mut().for_each(|e| {
+                if e.valid && e.gid == gid && !e.g && e.asid == asid {
                     e.valid = false;
                 }
             });
@@ -1107,14 +1665,15 @@ impl LoongArchCpu {
     pub fn tlb_flush_by_index(&mut self) {
         use super::mmu::{STLB_SETS, STLB_SIZE, TLB_TOTAL_SIZE};
 
-        let idx = (self.tlbidx & 0xFFF) as usize;
+        let idx = (self.active_tlbidx() & 0xFFF) as usize;
+        let mmu = self.active_tlb_mmu_mut();
         if idx < STLB_SIZE {
             let set = idx % STLB_SETS;
-            self.mmu.stlb[set].iter_mut().for_each(|e| {
+            mmu.stlb[set].iter_mut().for_each(|e| {
                 e.valid = false;
             });
         } else if idx < TLB_TOTAL_SIZE {
-            self.mmu.mtlb.iter_mut().for_each(|e| {
+            mmu.mtlb.iter_mut().for_each(|e| {
                 e.valid = false;
             });
         }
@@ -1122,82 +1681,100 @@ impl LoongArchCpu {
     }
 
     pub fn invtlb(&mut self, op: u32, asid: u16, va: u64) {
-        let should_flush = matches!(op, 0..=6);
+        let should_flush = matches!(op, 0..=6 | 0x9..=0xE | 0x10..=0x16);
+        let gid = self.target_gid();
         match op {
             0 | 1 => {
-                self.mmu.mtlb.iter_mut().for_each(|e| e.valid = false);
-                self.mmu.stlb.iter_mut().for_each(|s| {
+                let mmu = self.active_tlb_mmu_mut();
+                mmu.mtlb.iter_mut().for_each(|e| e.valid = false);
+                mmu.stlb.iter_mut().for_each(|s| {
                     s.iter_mut().for_each(|e| e.valid = false);
                 });
             }
             2 => {
-                self.mmu.mtlb.iter_mut().for_each(|e| {
-                    if e.g {
+                let mmu = self.active_tlb_mmu_mut();
+                mmu.mtlb.iter_mut().for_each(|e| {
+                    if e.g && e.gid == gid {
                         e.valid = false;
                     }
                 });
-                self.mmu.stlb.iter_mut().for_each(|s| {
+                mmu.stlb.iter_mut().for_each(|s| {
                     s.iter_mut().for_each(|e| {
-                        if e.g {
+                        if e.g && e.gid == gid {
                             e.valid = false;
                         }
                     });
                 });
             }
             3 => {
-                self.mmu.mtlb.iter_mut().for_each(|e| {
-                    if !e.g {
+                let mmu = self.active_tlb_mmu_mut();
+                mmu.mtlb.iter_mut().for_each(|e| {
+                    if !e.g && e.gid == gid {
                         e.valid = false;
                     }
                 });
-                self.mmu.stlb.iter_mut().for_each(|s| {
+                mmu.stlb.iter_mut().for_each(|s| {
                     s.iter_mut().for_each(|e| {
-                        if !e.g {
+                        if !e.g && e.gid == gid {
                             e.valid = false;
                         }
                     });
                 });
             }
             4 => {
-                self.mmu.mtlb.iter_mut().for_each(|e| {
-                    if !e.g && e.asid == asid {
+                let mmu = self.active_tlb_mmu_mut();
+                mmu.mtlb.iter_mut().for_each(|e| {
+                    if !e.g && e.gid == gid && e.asid == asid {
                         e.valid = false;
                     }
                 });
-                self.mmu.stlb.iter_mut().for_each(|s| {
+                mmu.stlb.iter_mut().for_each(|s| {
                     s.iter_mut().for_each(|e| {
-                        if !e.g && e.asid == asid {
+                        if !e.g && e.gid == gid && e.asid == asid {
                             e.valid = false;
                         }
                     });
                 });
             }
             5 => {
-                self.mmu.mtlb.iter_mut().for_each(|e| {
-                    if !e.g && Self::tlb_entry_matches_va(e, va, asid) {
+                let mmu = self.active_tlb_mmu_mut();
+                mmu.mtlb.iter_mut().for_each(|e| {
+                    if !e.g && Self::tlb_entry_matches_va(e, va, asid, gid) {
                         e.valid = false;
                     }
                 });
-                self.mmu.stlb.iter_mut().for_each(|s| {
+                mmu.stlb.iter_mut().for_each(|s| {
                     s.iter_mut().for_each(|e| {
-                        if !e.g && Self::tlb_entry_matches_va(e, va, asid) {
+                        if !e.g && Self::tlb_entry_matches_va(e, va, asid, gid)
+                        {
                             e.valid = false;
                         }
                     });
                 });
             }
             6 => {
-                self.mmu.mtlb.iter_mut().for_each(|e| {
-                    if Self::tlb_entry_matches_va(e, va, asid) {
+                let mmu = self.active_tlb_mmu_mut();
+                mmu.mtlb.iter_mut().for_each(|e| {
+                    if Self::tlb_entry_matches_va(e, va, asid, gid) {
                         e.valid = false;
                     }
                 });
-                self.mmu.stlb.iter_mut().for_each(|s| {
+                mmu.stlb.iter_mut().for_each(|s| {
                     s.iter_mut().for_each(|e| {
-                        if Self::tlb_entry_matches_va(e, va, asid) {
+                        if Self::tlb_entry_matches_va(e, va, asid, gid) {
                             e.valid = false;
                         }
                     });
+                });
+            }
+            0x9..=0xE | 0x10..=0x16 => {
+                self.mmu.mtlb.iter_mut().for_each(|e| e.valid = false);
+                self.mmu.stlb.iter_mut().for_each(|s| {
+                    s.iter_mut().for_each(|e| e.valid = false);
+                });
+                self.guest_mmu.mtlb.iter_mut().for_each(|e| e.valid = false);
+                self.guest_mmu.stlb.iter_mut().for_each(|s| {
+                    s.iter_mut().for_each(|e| e.valid = false);
                 });
             }
             _ => {}
@@ -1554,7 +2131,12 @@ impl LoongArchCpu {
         if hwi >= 8 {
             return;
         }
-        self.set_interrupt_bit_pending(2 + u32::from(hwi), pending);
+        let bit = 2 + u32::from(hwi);
+        if self.gintc & (1_u64 << (8 + hwi)) != 0 {
+            self.set_guest_interrupt_bit_pending(bit, pending);
+        } else {
+            self.set_interrupt_bit_pending(bit, pending);
+        }
     }
 
     pub fn set_ipi_interrupt_pending(&mut self, pending: bool) {
@@ -1578,6 +2160,23 @@ impl LoongArchCpu {
         }
     }
 
+    pub(crate) fn set_guest_interrupt_bit_pending(
+        &mut self,
+        bit: u32,
+        pending: bool,
+    ) {
+        let mask = 1_u64 << bit;
+        let was_pending = self.gcsr[CSR_ESTAT as usize] & mask != 0;
+        if pending {
+            self.gcsr[CSR_ESTAT as usize] |= mask;
+            if !was_pending {
+                self.wake_for_interrupt_request();
+            }
+        } else {
+            self.gcsr[CSR_ESTAT as usize] &= !mask;
+        }
+    }
+
     pub(crate) fn wake_if_new_enabled_interrupt(&mut self, was_pending: bool) {
         if !was_pending && self.pending_interrupt() {
             self.wake_for_interrupt_request();
@@ -1592,25 +2191,41 @@ impl LoongArchCpu {
 }
 
 impl LoongArchCpu {
-    pub fn timer_tick(&mut self, cycles: u64) {
-        if self.tcfg & 1 == 0 {
-            return;
+    fn tick_timer_values(tcfg: &mut u64, tval: &mut u64, cycles: u64) -> bool {
+        if *tcfg & 1 == 0 {
+            return false;
         }
-        if self.tval == 0 {
-            return;
+        if *tval == 0 {
+            return false;
         }
-        if self.tval <= cycles {
-            self.set_timer_interrupt_pending(true);
-            let periodic = self.tcfg & 2 != 0;
-            if periodic {
-                let init_val = self.tcfg & !0x3;
-                self.tval = init_val;
-            } else {
-                self.tval = 0;
-                self.tcfg &= !1;
-            }
+        if *tval > cycles {
+            *tval -= cycles;
+            return false;
+        }
+
+        let periodic = *tcfg & 2 != 0;
+        if periodic {
+            *tval = *tcfg & !0x3;
         } else {
-            self.tval -= cycles;
+            *tval = 0;
+            *tcfg &= !1;
+        }
+        true
+    }
+
+    pub fn timer_tick(&mut self, cycles: u64) {
+        if Self::tick_timer_values(&mut self.tcfg, &mut self.tval, cycles) {
+            self.set_timer_interrupt_pending(true);
+        }
+        if self.in_guest_mode() {
+            let mut tcfg = self.gcsr[CSR_TCFG as usize];
+            let mut tval = self.gcsr[CSR_TVAL as usize];
+            let expired = Self::tick_timer_values(&mut tcfg, &mut tval, cycles);
+            self.gcsr[CSR_TCFG as usize] = tcfg;
+            self.gcsr[CSR_TVAL as usize] = tval;
+            if expired {
+                self.set_guest_interrupt_bit_pending(11, true);
+            }
         }
     }
 }

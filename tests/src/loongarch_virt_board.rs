@@ -2,24 +2,29 @@ use std::io::Write;
 use std::sync::{Arc, Mutex};
 
 use machina_core::address::GPA;
-use machina_core::machine::{Machine, MachineOpts, NetdevOpts};
+use machina_core::machine::{LoaderSpec, Machine, MachineOpts, NetdevOpts};
 use machina_guest_loongarch::loongarch::csr::{
-    CRMD_DA, CRMD_IE, CSR_CRMD, CSR_ECFG,
+    CRMD_DA, CRMD_IE, CSR_CPUID, CSR_CRMD, CSR_ECFG,
 };
 use machina_hw_core::bus::SysBusMapping;
 use machina_hw_core::chardev::{ByteCb, CharFrontend, Chardev};
 use machina_hw_firmware::keys;
 use machina_hw_loongarch::interrupt::LOONGARCH_DEVICE_HWI;
 use machina_hw_loongarch::virt_machine::{
-    LoongArchVirtMachine, VIRT_EIOINTC_BASE, VIRT_EIOINTC_SIZE,
-    VIRT_FLASH0_BASE, VIRT_FLASH0_SIZE, VIRT_FLASH1_BASE, VIRT_FLASH1_SIZE,
-    VIRT_FWCFG_BASE, VIRT_FWCFG_SIZE, VIRT_IPI_BASE, VIRT_IPI_SIZE,
+    LoongArchVirtMachine, VIRT_CPU_COUNT_MAX, VIRT_EIOINTC_BASE,
+    VIRT_EIOINTC_SIZE, VIRT_FLASH0_BASE, VIRT_FLASH0_SIZE, VIRT_FLASH1_BASE,
+    VIRT_FLASH1_SIZE, VIRT_FWCFG_BASE, VIRT_FWCFG_SIZE, VIRT_IPI_BASE,
+    VIRT_IPI_SIZE, VIRT_LEGACY_IO_BASE, VIRT_LEGACY_IO_SIZE,
+    VIRT_LEGACY_IPI_BASE, VIRT_LEGACY_IPI_SIZE, VIRT_LEGACY_IPI_STRIDE,
     VIRT_PCH_MSI_BASE, VIRT_PCH_MSI_SIZE, VIRT_PCH_PIC_BASE, VIRT_PCH_PIC_SIZE,
-    VIRT_RAM_BASE, VIRT_RTC_BASE, VIRT_RTC_SIZE, VIRT_UART_BASE,
-    VIRT_UART_SIZE, VIRT_VIRTIO_BASE, VIRT_VIRTIO_SIZE,
+    VIRT_PCI_CFG_BASE, VIRT_PCI_CFG_SIZE, VIRT_PCI_HT_CFG_BASE, VIRT_RAM_BASE,
+    VIRT_RTC_BASE, VIRT_RTC_SIZE, VIRT_UART1_BASE, VIRT_UART1_SIZE,
+    VIRT_UART_BASE, VIRT_UART_SIZE, VIRT_VIRTIO_BASE, VIRT_VIRTIO_SIZE,
 };
 
 const LOONGARCH_RTC_PCH_IRQ_UNDER_TEST: u32 = 6;
+const UART_LSR_OFFSET: u64 = 5;
+const UART_LSR_THRE: u64 = 1 << 5;
 
 fn default_opts() -> MachineOpts {
     MachineOpts {
@@ -81,6 +86,24 @@ impl Chardev for CapturingInputChardev {
     }
 }
 
+struct CapturingOutputChardev {
+    written: Arc<Mutex<Vec<u8>>>,
+}
+
+impl Chardev for CapturingOutputChardev {
+    fn read(&mut self) -> Option<u8> {
+        None
+    }
+
+    fn write(&mut self, data: u8) {
+        self.written.lock().unwrap().push(data);
+    }
+
+    fn can_read(&self) -> bool {
+        false
+    }
+}
+
 #[test]
 fn task42_virt_board_realizes_expected_mmio_map() {
     let mut machine = LoongArchVirtMachine::new();
@@ -127,6 +150,190 @@ fn task42_virt_board_realizes_expected_mmio_map() {
     let cpu = cpu.lock().unwrap();
     assert_eq!(cpu.ram_base_val(), VIRT_RAM_BASE);
     assert_eq!(cpu.ram_end_val(), VIRT_RAM_BASE + opts.ram_size);
+}
+
+#[test]
+fn task96_virt_board_maps_hvisor_uart1_console() {
+    let mut machine = LoongArchVirtMachine::new();
+    machine.init(&default_opts()).expect("init loongarch ref");
+
+    assert_mapping(
+        &machine.sysbus().mappings(),
+        "uart1",
+        VIRT_UART1_BASE,
+        VIRT_UART1_SIZE,
+    );
+
+    let as_ = machine.address_space();
+    assert_eq!(
+        as_.read(GPA::new(VIRT_UART1_BASE + UART_LSR_OFFSET), 1)
+            & UART_LSR_THRE,
+        UART_LSR_THRE,
+        "hvisor uart1_putchar waits for LSR.THRE before writing"
+    );
+    as_.write(GPA::new(VIRT_UART1_BASE), 1, u64::from(b'H'));
+    assert_eq!(
+        as_.read(GPA::new(VIRT_UART1_BASE + UART_LSR_OFFSET), 1)
+            & UART_LSR_THRE,
+        UART_LSR_THRE
+    );
+}
+
+#[test]
+fn task96_virt_board_routes_hvisor_uart1_output_to_chardev() {
+    let written = Arc::new(Mutex::new(Vec::new()));
+    let frontend = CharFrontend::new(Box::new(CapturingOutputChardev {
+        written: Arc::clone(&written),
+    }));
+
+    let mut machine = LoongArchVirtMachine::new();
+    machine.set_uart1_chardev(frontend).unwrap();
+    machine.init(&default_opts()).expect("init loongarch ref");
+
+    machine.address_space().write(
+        GPA::new(VIRT_UART1_BASE),
+        1,
+        u64::from(b'H'),
+    );
+
+    assert_eq!(&*written.lock().unwrap(), b"H");
+}
+
+#[test]
+fn task97_virt_board_maps_hvisor_legacy_ipi_for_smp_boot() {
+    let mut opts = default_opts();
+    opts.cpu_count = 4;
+
+    let mut machine = LoongArchVirtMachine::new();
+    machine.init(&opts).expect("init loongarch smp ref");
+
+    assert_eq!(machine.cpu_count(), 4);
+    for cpu_id in 0..opts.cpu_count {
+        let cpu = machine.cpu_at(cpu_id as usize);
+        assert_eq!(cpu.lock().unwrap().csr_read(CSR_CPUID), u64::from(cpu_id));
+        let ipi_base =
+            VIRT_LEGACY_IPI_BASE + u64::from(cpu_id) * VIRT_LEGACY_IPI_STRIDE;
+        assert!(
+            machine.address_space().is_mapped(GPA::new(ipi_base), 1)
+                && machine.address_space().is_mapped(
+                    GPA::new(ipi_base + VIRT_LEGACY_IPI_SIZE - 1),
+                    1,
+                ),
+            "missing legacy IPI MMIO for CPU {cpu_id}",
+        );
+    }
+
+    let entry = 0x1f000_0000;
+    let cpu1_base = VIRT_LEGACY_IPI_BASE + VIRT_LEGACY_IPI_STRIDE;
+    machine
+        .address_space()
+        .write(GPA::new(cpu1_base + 0x20), 8, entry);
+    machine
+        .address_space()
+        .write(GPA::new(cpu1_base + 0x08), 4, 1);
+
+    assert_eq!(machine.ipi().mmio_read_sized(1, 0x20, 8), entry);
+    assert_eq!(machine.ipi().mmio_read_sized(1, 0, 4) & 1, 1);
+}
+
+#[test]
+fn task97_virt_board_rejects_too_many_cpus() {
+    let mut opts = default_opts();
+    opts.cpu_count = VIRT_CPU_COUNT_MAX + 1;
+
+    let mut machine = LoongArchVirtMachine::new();
+    let err = machine
+        .init(&opts)
+        .expect_err("loongarch64-ref must reject too many CPUs");
+    let msg = err.to_string();
+    assert!(
+        msg.contains(&format!(
+            "loongarch64-ref supports at most {VIRT_CPU_COUNT_MAX} CPUs"
+        )),
+        "missing CPU-count limit error: {msg}"
+    );
+}
+
+#[test]
+fn task98_virt_board_reports_empty_loongarch_pci_config_space() {
+    let mut machine = LoongArchVirtMachine::new();
+    machine.init(&default_opts()).expect("init loongarch ref");
+
+    for base in [VIRT_PCI_CFG_BASE, VIRT_PCI_HT_CFG_BASE] {
+        assert!(machine.address_space().is_mapped(GPA::new(base), 4));
+        assert!(machine
+            .address_space()
+            .is_mapped(GPA::new(base + VIRT_PCI_CFG_SIZE - 4), 4));
+        assert_eq!(machine.address_space().read(GPA::new(base), 1), 0xff);
+        assert_eq!(machine.address_space().read(GPA::new(base), 2), 0xffff);
+        assert_eq!(
+            machine.address_space().read(GPA::new(base), 4),
+            0xffff_ffff
+        );
+        assert_eq!(
+            machine.address_space().read(GPA::new(base + 0x800), 8),
+            0xffff_ffff_ffff_ffff,
+        );
+
+        machine.address_space().write(GPA::new(base), 4, 0);
+        assert_eq!(
+            machine.address_space().read(GPA::new(base), 4),
+            0xffff_ffff
+        );
+    }
+}
+
+#[test]
+fn task98_virt_board_reports_empty_legacy_io_space() {
+    let mut machine = LoongArchVirtMachine::new();
+    machine.init(&default_opts()).expect("init loongarch ref");
+
+    let as_ = machine.address_space();
+    assert!(as_.is_mapped(GPA::new(VIRT_LEGACY_IO_BASE), 1));
+    assert!(
+        as_.is_mapped(
+            GPA::new(VIRT_LEGACY_IO_BASE + VIRT_LEGACY_IO_SIZE - 1),
+            1,
+        )
+    );
+    assert_eq!(as_.read(GPA::new(VIRT_LEGACY_IO_BASE + 0x64), 1), 0xff);
+    as_.write(GPA::new(VIRT_LEGACY_IO_BASE + 0x64), 1, 0);
+    assert_eq!(as_.read(GPA::new(VIRT_LEGACY_IO_BASE + 0x64), 1), 0xff);
+}
+
+#[test]
+fn task99_virt_board_applies_raw_loader_to_low_physical_ram() {
+    let mut kernel = tempfile::NamedTempFile::new().unwrap();
+    kernel.write_all(&[0u8; 4]).unwrap();
+    kernel.flush().unwrap();
+    let mut payload = tempfile::NamedTempFile::new().unwrap();
+    payload.write_all(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee]).unwrap();
+    payload.flush().unwrap();
+
+    let mut opts = default_opts();
+    opts.kernel = Some(kernel.path().to_path_buf());
+    opts.loaders.push(LoaderSpec {
+        file: payload.path().to_path_buf(),
+        addr: 0x0100_0000,
+        force_raw: true,
+    });
+
+    let mut machine = LoongArchVirtMachine::new();
+    machine.init(&opts).expect("init loongarch ref");
+    machine.boot().expect("boot loongarch ref");
+
+    assert_eq!(
+        machine
+            .address_space()
+            .read(GPA::new(VIRT_RAM_BASE + 0x0100_0000), 4),
+        0xddcc_bbaa,
+    );
+    assert_eq!(
+        machine
+            .address_space()
+            .read(GPA::new(VIRT_RAM_BASE + 0x0100_0004), 1),
+        0xee,
+    );
 }
 
 #[test]

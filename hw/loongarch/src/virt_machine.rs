@@ -2,15 +2,16 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use machina_core::address::GPA;
-use machina_core::machine::{Machine, MachineOpts, MachineState};
+use machina_core::machine::{LoaderSpec, Machine, MachineOpts, MachineState};
 use machina_guest_loongarch::loongarch::cpu::{
     LoongArchCpu, LoongArchCpuInterruptState,
 };
 use machina_guest_loongarch::loongarch::csr::{CRMD_DA, CSR_CRMD};
 use machina_hw_char::uart::{Uart16550, Uart16550Mmio};
 use machina_hw_core::bus::{SysBus, SysBusError};
-use machina_hw_core::chardev::{CharFrontend, StdioChardev};
+use machina_hw_core::chardev::{CharFrontend, StdioChardev, StdoutChardev};
 use machina_hw_core::irq::{InterruptSource, IrqSink};
+use machina_hw_core::loader;
 use machina_hw_firmware::{keys, FwCfg, FwCfgMmio};
 use machina_hw_intc::eiointc::{Eiointc, EiointcIrqSink, EiointcMmio};
 use machina_hw_intc::ipi::{LoongArchIpi, LoongArchIpiMmio};
@@ -24,7 +25,7 @@ use machina_hw_storage::{FlashMedia, MemBackend};
 use machina_hw_virtio::mmio::VirtioMmio;
 use machina_memory::address_space::AddressSpace;
 use machina_memory::ram::RamBlock;
-use machina_memory::region::MemoryRegion;
+use machina_memory::region::{MemoryRegion, MmioOps};
 
 use crate::boot;
 use crate::interrupt::{
@@ -35,11 +36,36 @@ use crate::iocsr::VirtIocsrBus;
 
 type UartRxCallback = Arc<Mutex<dyn FnMut(u8) + Send>>;
 type LoongArchPFlash = PFlashCfi01<MemBackend>;
+pub type RuntimeLoongArchCpuState =
+    (LoongArchCpu, Arc<LoongArchCpuInterruptState>);
+
+struct EmptyPciConfigMmio;
+
+impl MmioOps for EmptyPciConfigMmio {
+    fn read(&self, _offset: u64, size: u32) -> u64 {
+        match size {
+            1 => 0xff,
+            2 => 0xffff,
+            4 => 0xffff_ffff,
+            8 => 0xffff_ffff_ffff_ffff,
+            _ => 0,
+        }
+    }
+
+    fn write(&self, _offset: u64, _size: u32, _val: u64) {}
+}
 
 pub const VIRT_UART_BASE: u64 = 0x1FE0_01E0;
 pub const VIRT_UART_SIZE: u64 = 0x8;
+pub const VIRT_UART1_BASE: u64 = 0x1008_0000;
+pub const VIRT_UART1_SIZE: u64 = 0x8;
 pub const VIRT_IPI_BASE: u64 = 0x0100_0000;
 pub const VIRT_IPI_SIZE: u64 = 0x100;
+pub const VIRT_LEGACY_IPI_BASE: u64 = 0x1FE0_1000;
+pub const VIRT_LEGACY_IPI_SIZE: u64 = 0x100;
+pub const VIRT_LEGACY_IPI_STRIDE: u64 = 0x100;
+pub const VIRT_LEGACY_IO_BASE: u64 = 0x8000;
+pub const VIRT_LEGACY_IO_SIZE: u64 = 0x1_0000;
 pub const VIRT_EIOINTC_BASE: u64 = 0x0200_0000;
 pub const VIRT_EIOINTC_SIZE: u64 = 0x1_0000;
 pub const VIRT_PCH_PIC_BASE: u64 = 0x1000_0000;
@@ -58,8 +84,12 @@ pub const VIRT_VIRTIO_BASE: u64 = 0x1000_8000;
 pub const VIRT_VIRTIO_SIZE: u64 = 0x1000;
 pub const VIRT_FWCFG_BASE: u64 = 0x1E02_0000;
 pub const VIRT_FWCFG_SIZE: u64 = 0x18;
+pub const VIRT_PCI_CFG_BASE: u64 = 0x00FE_0000_0000;
+pub const VIRT_PCI_HT_CFG_BASE: u64 = 0x0EFE_0000_0000;
+pub const VIRT_PCI_CFG_SIZE: u64 = 0x2000_0000;
 pub const VIRT_RAM_BASE: u64 = 0x9000_0000_0000_0000;
 pub const VIRT_RAM_SIZE_DEFAULT: u64 = 256 * 1024 * 1024;
+pub const VIRT_CPU_COUNT_MAX: u32 = 256;
 
 pub const VIRT_CPUCFG_PRID: u32 = 0x0014_C010;
 
@@ -81,11 +111,12 @@ pub struct LoongArchVirtMachine {
     name: String,
     machine_state: MachineState,
     ram_size: u64,
-    cpu: Option<Arc<Mutex<LoongArchCpu>>>,
+    cpus: Vec<Arc<Mutex<LoongArchCpu>>>,
     address_space: Option<AddressSpace>,
     sysbus: Option<SysBus>,
     ram_block: Option<Arc<RamBlock>>,
     uart: Option<Arc<Uart16550>>,
+    uart1: Option<Arc<Uart16550>>,
     ipi: Option<Arc<LoongArchIpi>>,
     pch_msi: Option<Arc<PchMsi>>,
     rtc: Option<Arc<Ls7aRtc>>,
@@ -98,7 +129,9 @@ pub struct LoongArchVirtMachine {
     kernel_path: Option<PathBuf>,
     initrd_path: Option<PathBuf>,
     kernel_cmdline: Option<String>,
+    loaders: Vec<LoaderSpec>,
     uart_chardev: Option<CharFrontend>,
+    uart1_chardev: Option<CharFrontend>,
 }
 
 impl LoongArchVirtMachine {
@@ -108,11 +141,12 @@ impl LoongArchVirtMachine {
             name: "loongarch64-ref".to_string(),
             machine_state: MachineState::new_root("machine"),
             ram_size: 0,
-            cpu: None,
+            cpus: Vec::new(),
             address_space: None,
             sysbus: None,
             ram_block: None,
             uart: None,
+            uart1: None,
             ipi: None,
             pch_msi: None,
             rtc: None,
@@ -125,7 +159,9 @@ impl LoongArchVirtMachine {
             kernel_path: None,
             initrd_path: None,
             kernel_cmdline: None,
+            loaders: Vec::new(),
             uart_chardev: None,
+            uart1_chardev: None,
         }
     }
 
@@ -141,7 +177,12 @@ impl LoongArchVirtMachine {
 
     #[must_use]
     pub fn cpu(&self) -> Arc<Mutex<LoongArchCpu>> {
-        Arc::clone(self.cpu.as_ref().expect("machine not initialized"))
+        self.cpu_at(0)
+    }
+
+    #[must_use]
+    pub fn cpu_at(&self, cpu_id: usize) -> Arc<Mutex<LoongArchCpu>> {
+        Arc::clone(self.cpus.get(cpu_id).expect("machine CPU not initialized"))
     }
 
     #[must_use]
@@ -154,30 +195,54 @@ impl LoongArchVirtMachine {
         Arc::clone(self.uart.as_ref().expect("machine not initialized"))
     }
 
+    #[must_use]
+    pub fn uart1(&self) -> Arc<Uart16550> {
+        Arc::clone(self.uart1.as_ref().expect("machine not initialized"))
+    }
+
     pub fn take_runtime_cpu_state(
         &mut self,
-    ) -> Result<
-        (LoongArchCpu, Arc<LoongArchCpuInterruptState>),
-        Box<dyn std::error::Error>,
-    > {
+    ) -> Result<RuntimeLoongArchCpuState, Box<dyn std::error::Error>> {
+        self.take_runtime_cpu_state_at(0)
+    }
+
+    pub fn take_runtime_cpu_state_at(
+        &mut self,
+        cpu_id: usize,
+    ) -> Result<RuntimeLoongArchCpuState, Box<dyn std::error::Error>> {
         let interrupts = Arc::new(LoongArchCpuInterruptState::default());
-        self.ipi()
-            .connect_output(0, runtime_ipi_source(Arc::clone(&interrupts)));
+        self.ipi().connect_output(
+            cpu_id as u32,
+            runtime_ipi_source(Arc::clone(&interrupts)),
+        );
         self.interrupt_cascade
             .as_ref()
             .expect("machine not initialized")
             .connect_cpu_hwi_async(
-                0,
+                cpu_id as u32,
                 LOONGARCH_DEVICE_HWI,
                 Arc::clone(&interrupts),
             );
 
-        let cpu_arc = self.cpu();
+        let cpu_arc = self.cpu_at(cpu_id);
         let mut guard = cpu_arc.lock().unwrap();
-        let cpu = std::mem::replace(&mut *guard, LoongArchCpu::new());
+        let mut replacement = LoongArchCpu::new();
+        replacement.set_cpuid(cpu_id as u64);
+        let cpu = std::mem::replace(&mut *guard, replacement);
         drop(guard);
 
         Ok((cpu, interrupts))
+    }
+
+    pub fn take_runtime_cpu_states(
+        &mut self,
+    ) -> Result<Vec<RuntimeLoongArchCpuState>, Box<dyn std::error::Error>> {
+        let count = self.cpus.len();
+        let mut states = Vec::with_capacity(count);
+        for cpu_id in 0..count {
+            states.push(self.take_runtime_cpu_state_at(cpu_id)?);
+        }
+        Ok(states)
     }
 
     #[must_use]
@@ -246,6 +311,19 @@ impl LoongArchVirtMachine {
         Ok(())
     }
 
+    pub fn set_uart1_chardev(
+        &mut self,
+        frontend: CharFrontend,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if self.uart1.is_some() {
+            return Err(
+                "loongarch64-ref UART1 chardev must be set before init".into(),
+            );
+        }
+        self.uart1_chardev = Some(frontend);
+        Ok(())
+    }
+
     #[must_use]
     pub fn virtio_mmio(&self) -> Option<&VirtioMmio> {
         self.virtio_mmio.as_ref()
@@ -254,6 +332,7 @@ impl LoongArchVirtMachine {
     fn attach_interrupt_devices(
         sysbus: &mut SysBus,
         ipi: &Arc<LoongArchIpi>,
+        cpu_count: u32,
         eiointc: &Arc<Eiointc>,
         pch_pic: &Arc<PchPic>,
         pch_msi: &Arc<PchMsi>,
@@ -267,6 +346,19 @@ impl LoongArchVirtMachine {
             ),
             GPA::new(VIRT_IPI_BASE),
         )?;
+        for cpu_id in 0..cpu_count {
+            ipi.register_mmio(
+                MemoryRegion::io(
+                    &format!("ipi{cpu_id}"),
+                    VIRT_LEGACY_IPI_SIZE,
+                    Arc::new(LoongArchIpiMmio(Arc::clone(ipi), cpu_id)),
+                ),
+                GPA::new(
+                    VIRT_LEGACY_IPI_BASE
+                        + u64::from(cpu_id) * VIRT_LEGACY_IPI_STRIDE,
+                ),
+            )?;
+        }
 
         eiointc.attach_to_bus(sysbus)?;
         eiointc.register_mmio(
@@ -349,6 +441,54 @@ impl LoongArchVirtMachine {
         )?;
         Ok(pflash)
     }
+
+    fn loader_addr_to_ram_alias(
+        &self,
+        addr: u64,
+        size: u64,
+    ) -> Result<u64, Box<dyn std::error::Error>> {
+        let end = addr
+            .checked_add(size)
+            .ok_or("loongarch64-ref loader range end overflows u64")?;
+        let high_ram_end = VIRT_RAM_BASE
+            .checked_add(self.ram_size)
+            .ok_or("loongarch64-ref high RAM range end overflows u64")?;
+
+        if end <= self.ram_size {
+            return Ok(VIRT_RAM_BASE + addr);
+        }
+        if addr >= VIRT_RAM_BASE && end <= high_ram_end {
+            return Ok(addr);
+        }
+
+        Err(format!(
+            "loongarch64-ref loader range {:#x}..{:#x} is outside RAM \
+             0x0..{:#x} / {:#x}..{:#x}",
+            addr, end, self.ram_size, VIRT_RAM_BASE, high_ram_end
+        )
+        .into())
+    }
+
+    fn apply_loaders(&self) -> Result<(), Box<dyn std::error::Error>> {
+        for loader_spec in &self.loaders {
+            if !loader_spec.force_raw {
+                return Err(
+                    "loongarch64-ref loader requires force-raw=on".into()
+                );
+            }
+            let data = std::fs::read(&loader_spec.file)?;
+            let load_addr = self.loader_addr_to_ram_alias(
+                loader_spec.addr,
+                data.len() as u64,
+            )?;
+            loader::load_binary(
+                &data,
+                GPA::new(load_addr),
+                self.address_space(),
+            )?;
+        }
+        Ok(())
+    }
 }
 
 impl Default for LoongArchVirtMachine {
@@ -377,8 +517,14 @@ impl Machine for LoongArchVirtMachine {
         if opts.ram_size == 0 {
             return Err("ram_size must be greater than 0".into());
         }
-        if opts.cpu_count != 1 {
-            return Err("loongarch64-ref currently supports one CPU".into());
+        if opts.cpu_count == 0 {
+            return Err("loongarch64-ref requires at least one CPU".into());
+        }
+        if opts.cpu_count > VIRT_CPU_COUNT_MAX {
+            return Err(format!(
+                "loongarch64-ref supports at most {VIRT_CPU_COUNT_MAX} CPUs"
+            )
+            .into());
         }
         if opts.netdev.is_some() {
             return Err(
@@ -391,17 +537,44 @@ impl Machine for LoongArchVirtMachine {
         self.kernel_path = opts.kernel.clone();
         self.initrd_path = opts.initrd.clone();
         self.kernel_cmdline = opts.append.clone();
+        self.loaders = opts.loaders.clone();
 
         let mut sysbus = SysBus::new("sysbus0");
         let mut root = MemoryRegion::container("system", u64::MAX);
 
         let (ram_region, ram_block) = MemoryRegion::ram("ram", opts.ram_size);
         root.add_subregion(ram_region, GPA::new(VIRT_RAM_BASE));
+        root.add_subregion(
+            MemoryRegion::io(
+                "pci-cfg-empty",
+                VIRT_PCI_CFG_SIZE,
+                Arc::new(EmptyPciConfigMmio),
+            ),
+            GPA::new(VIRT_PCI_CFG_BASE),
+        );
+        root.add_subregion(
+            MemoryRegion::io(
+                "pci-ht-cfg-empty",
+                VIRT_PCI_CFG_SIZE,
+                Arc::new(EmptyPciConfigMmio),
+            ),
+            GPA::new(VIRT_PCI_HT_CFG_BASE),
+        );
+        root.add_subregion(
+            MemoryRegion::io(
+                "legacy-io-empty",
+                VIRT_LEGACY_IO_SIZE,
+                Arc::new(EmptyPciConfigMmio),
+            ),
+            GPA::new(VIRT_LEGACY_IO_BASE),
+        );
 
         let fw_cfg = FwCfg::new_named("fw_cfg0");
-        fw_cfg.add_i16(keys::MAX_CPUS, opts.cpu_count as u16);
+        let fw_cfg_cpu_count = u16::try_from(opts.cpu_count)
+            .expect("LoongArch CPU count is validated for fw_cfg");
+        fw_cfg.add_i16(keys::MAX_CPUS, fw_cfg_cpu_count);
         fw_cfg.add_i64(keys::RAM_SIZE, opts.ram_size);
-        fw_cfg.add_i16(keys::NB_CPUS, opts.cpu_count as u16);
+        fw_cfg.add_i16(keys::NB_CPUS, fw_cfg_cpu_count);
         fw_cfg.attach_to_bus(&mut sysbus)?;
         let fw_cfg_region = MemoryRegion::io(
             "fw_cfg0",
@@ -410,28 +583,34 @@ impl Machine for LoongArchVirtMachine {
         );
         fw_cfg.register_mmio(fw_cfg_region, GPA::new(VIRT_FWCFG_BASE))?;
 
-        let cpu = Arc::new(Mutex::new(LoongArchCpu::new()));
-        {
-            let ram_ptr = ram_block.as_ptr() as usize;
-            let mut cpu_guard = cpu.lock().unwrap();
-            cpu_guard.set_cpuid(0);
-            cpu_guard.set_guest_base(
-                ram_ptr.wrapping_sub(VIRT_RAM_BASE as usize) as u64,
-            );
-            cpu_guard.set_ram_base(VIRT_RAM_BASE);
-            cpu_guard.set_ram_end(VIRT_RAM_BASE + opts.ram_size);
+        let ram_ptr = ram_block.as_ptr() as usize;
+        let mut cpus = Vec::with_capacity(opts.cpu_count as usize);
+        for cpu_id in 0..opts.cpu_count {
+            let cpu = Arc::new(Mutex::new(LoongArchCpu::new()));
+            {
+                let mut cpu_guard = cpu.lock().unwrap();
+                cpu_guard.set_cpuid(u64::from(cpu_id));
+                cpu_guard.set_guest_base(
+                    ram_ptr.wrapping_sub(VIRT_RAM_BASE as usize) as u64,
+                );
+                cpu_guard.set_ram_base(VIRT_RAM_BASE);
+                cpu_guard.set_ram_end(VIRT_RAM_BASE + opts.ram_size);
+            }
+            cpus.push(cpu);
         }
 
         let ipi = Arc::new(LoongArchIpi::new_named("ipi0", opts.cpu_count));
-        ipi.connect_output(
-            0,
-            InterruptSource::new(
-                Arc::new(LoongArchCpuIpiSink {
-                    cpu: Arc::clone(&cpu),
-                }) as Arc<dyn IrqSink>,
-                0,
-            ),
-        );
+        for (cpu_id, cpu) in cpus.iter().enumerate() {
+            ipi.connect_output(
+                cpu_id as u32,
+                InterruptSource::new(
+                    Arc::new(LoongArchCpuIpiSink {
+                        cpu: Arc::clone(cpu),
+                    }) as Arc<dyn IrqSink>,
+                    0,
+                ),
+            );
+        }
 
         let eiointc = Arc::new(Eiointc::new_named("eiointc0", opts.cpu_count));
         let pch_pic = Arc::new(PchPic::new_named("pch-pic0", 32));
@@ -444,7 +623,13 @@ impl Machine for LoongArchVirtMachine {
             Arc::clone(&pch_pic),
             Arc::clone(&eiointc),
         );
-        cascade.connect_cpu_hwi(0, LOONGARCH_DEVICE_HWI, Arc::clone(&cpu));
+        for (cpu_id, cpu) in cpus.iter().enumerate() {
+            cascade.connect_cpu_hwi(
+                cpu_id as u32,
+                LOONGARCH_DEVICE_HWI,
+                Arc::clone(cpu),
+            );
+        }
         for irq in 0..LOONGARCH_PCH_MSI_IRQ_NUM {
             let eio_irq = LOONGARCH_PCH_MSI_IRQ_BASE + irq;
             pch_msi.connect_output(
@@ -460,11 +645,14 @@ impl Machine for LoongArchVirtMachine {
 
         let iocsr_bus =
             VirtIocsrBus::new(Arc::clone(&ipi), Arc::clone(&eiointc));
-        iocsr_bus.install_on(&mut cpu.lock().unwrap());
+        for cpu in &cpus {
+            iocsr_bus.install_on(&mut cpu.lock().unwrap());
+        }
 
         Self::attach_interrupt_devices(
             &mut sysbus,
             &ipi,
+            opts.cpu_count,
             &eiointc,
             &pch_pic,
             &pch_msi,
@@ -529,6 +717,24 @@ impl Machine for LoongArchVirtMachine {
             )))?;
         }
 
+        let uart1 = Arc::new(Uart16550::new_named("uart1"));
+        uart1.attach_to_bus(&mut sysbus)?;
+        uart1.register_mmio(
+            MemoryRegion::io(
+                "uart1",
+                VIRT_UART1_SIZE,
+                Arc::new(Uart16550Mmio(Arc::clone(&uart1))),
+            ),
+            GPA::new(VIRT_UART1_BASE),
+        )?;
+        if let Some(frontend) = self.uart1_chardev.take() {
+            uart1.attach_chardev(frontend)?;
+        } else if opts.nographic {
+            uart1.attach_chardev(CharFrontend::new(Box::new(
+                StdoutChardev::new(),
+            )))?;
+        }
+
         let mut virtio_mmio = if let Some(drive_path) = &opts.drive {
             use machina_hw_virtio::block::VirtioBlk;
 
@@ -582,12 +788,18 @@ impl Machine for LoongArchVirtMachine {
             uart_for_rx.receive(byte);
         }));
         uart.realize_onto(&mut sysbus, &mut address_space, rx_cb)?;
+        let uart1_for_rx = Arc::clone(&uart1);
+        let rx_cb: UartRxCallback = Arc::new(Mutex::new(move |byte: u8| {
+            uart1_for_rx.receive(byte);
+        }));
+        uart1.realize_onto(&mut sysbus, &mut address_space, rx_cb)?;
 
-        self.cpu = Some(cpu);
+        self.cpus = cpus;
         self.address_space = Some(address_space);
         self.sysbus = Some(sysbus);
         self.ram_block = Some(ram_block);
         self.uart = Some(uart);
+        self.uart1 = Some(uart1);
         self.ipi = Some(ipi);
         self.pch_msi = Some(pch_msi);
         self.rtc = Some(rtc);
@@ -604,6 +816,9 @@ impl Machine for LoongArchVirtMachine {
     fn reset(&mut self) {
         if let Some(uart) = &self.uart {
             uart.reset_runtime();
+        }
+        if let Some(uart1) = &self.uart1 {
+            uart1.reset_runtime();
         }
         if let Some(pch_msi) = &self.pch_msi {
             pch_msi.reset_runtime();
@@ -639,6 +854,7 @@ impl Machine for LoongArchVirtMachine {
         let boot_config = boot::DirectKernelBootConfig {
             cmdline: self.kernel_cmdline.as_deref(),
             initrd_path: self.initrd_path.as_deref(),
+            cpu_count: self.cpus.len() as u32,
             has_virtio_mmio: self.virtio_mmio.is_some(),
             fw_cfg: self.fw_cfg.as_ref().map(Arc::clone),
         };
@@ -648,6 +864,7 @@ impl Machine for LoongArchVirtMachine {
             self.ram_size,
             self.address_space(),
         )?;
+        self.apply_loaders()?;
 
         let cpu = self.cpu();
         let mut cpu = cpu.lock().unwrap();
@@ -656,11 +873,26 @@ impl Machine for LoongArchVirtMachine {
         cpu.write_gpr(4, boot_info.efi_boot);
         cpu.write_gpr(5, boot_info.cmdline_addr);
         cpu.write_gpr(6, boot_info.system_table_addr);
+        drop(cpu);
+
+        if self.cpus.len() > 1 {
+            let secondary_entry = boot::install_secondary_boot_code(
+                self.ram_size,
+                self.address_space(),
+            )?;
+            for cpu_id in 1..self.cpus.len() {
+                let cpu = self.cpu_at(cpu_id);
+                let mut cpu = cpu.lock().unwrap();
+                cpu.set_pc(secondary_entry);
+                cpu.csr_write(CSR_CRMD, CRMD_DA);
+                cpu.write_gpr(5, boot_info.cmdline_addr);
+            }
+        }
         Ok(())
     }
 
     fn cpu_count(&self) -> usize {
-        usize::from(self.cpu.is_some())
+        self.cpus.len()
     }
 
     fn ram_size(&self) -> u64 {
