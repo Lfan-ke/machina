@@ -356,11 +356,19 @@ fn parse_args() -> Result<CliArgs, String> {
             "-gdb" => {
                 i += 1;
                 let s = args.get(i).ok_or("-gdb requires argument")?;
-                if s.starts_with("tcp:") || s == "stdio" {
-                    cli.gdb = Some(s.clone());
-                } else {
+                if s == "stdio" {
+                    // stdio mode was previously accepted at parse time
+                    // but the GDB server thread only handles tcp: and
+                    // silently dropped stdio, while still printing
+                    // "machina: gdb on stdio". Reject it explicitly.
+                    return Err("-gdb: stdio transport is not implemented; \
+                         use -gdb tcp:<host>:<port>"
+                        .to_string());
+                }
+                if !s.starts_with("tcp:") {
                     return Err(format!("-gdb: unsupported: {}", s));
                 }
+                cli.gdb = Some(s.clone());
             }
             "-h" | "--help" => {
                 usage();
