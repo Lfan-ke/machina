@@ -812,6 +812,51 @@ cargo test -- --test-threads=1    # 串行（调试用）
 cargo test -- --test-threads=4    # 4 线程
 ```
 
+#### 按改动主题选最窄的 filter
+
+迭代时优先用按主题命中的 filter，不要默认跑全量 `make test`。
+`cargo test` 只接受一个 `TESTNAME` 位置参数，所以下表每行只给一
+个 filter，按子串匹配选中所有符合的模块（例如 `cli_` / `riscv_`
+匹配所有同前缀模块）。若一个主题确实需要多个前缀，拆成多行，
+每行都能原样复制粘贴到 `cargo test -p machina-tests <filter>`。
+
+| 改动区域 | Filter | 备注 |
+|----------|--------|------|
+| CLI 参数解析（`-kernel`、`-bios`、`-drive`、`-netdev`、`-initrd`、`-m` 等） | `cli_` | 子串匹配 `tests/src/cli_*` 全部模块；spawn 已编译二进制，首跑顺带重建。 |
+| 反汇编器（RV64 / Zb*、RVC） | `disas` | 纯逻辑，跑得快。 |
+| Decode DSL（`.decode` 解析 + 代码生成） | `decode` | 纯逻辑，跑得快。 |
+| Memory region、FlatView、AddressSpace | `memory_region` | 纯逻辑，跑得快。 |
+| ELF / 裸 kernel loader | `hw_loader` | 在内存里造 ELF。 |
+| 硬件设备模型（PLIC、ACLINT、UART、GPIO、RTC、SD、SSI、IPI 等） | `hw_` | 子串匹配 `tests/src/hw_*` 全部模块。 |
+| RISC-V CPU 语义：CSR、MMU、PMP、异常 | `riscv_` | 子串匹配 `riscv_csr` / `riscv_mmu` / `riscv_pmp` / `riscv_exception` / `riscv_thead_csr` / `riscv_cpu_model`。如需更窄，换成具体前缀（如 `riscv_csr`）。 |
+| RISC-V frontend（指令解码 + IR 发射） | `frontend` | 覆盖 RV64I/M/F/C。 |
+| x86-64 backend（指令编码） | `backend` | x86-64 发射器；和 `frontend` 分两次跑。 |
+| LoongArch 客户机（decode、exec、board） | `loongarch_` | 子串匹配 `loongarch_*` 全部模块。 |
+| VirtIO 传输 / block / net | `virtio` | `virtio_net` 用例需要 Unix 宿主，CI 在 Linux 跑。 |
+| Monitor（HMP、MMP/QMP、快照、TCP） | `monitor` | TCP 用例 bind `127.0.0.1:0`。 |
+| GDB stub | `gdbstub` | spawn 已编译二进制，注意首跑耗时。 |
+| 启动工具（irbackend、irdump、冒烟） | `tools` | spawn 已编译二进制。 |
+| RISC-V difftest vs 用户态 QEMU | `difftest` | 子串匹配 `frontend::difftest` 下的 `difftest_*` 用例；PATH 上需要 `qemu-riscv64`（用户态），**不是** `qemu-system-riscv64`。 |
+| LoongArch difftest vs 用户态 QEMU | `loongarch_difftest` | PATH 上需要 `qemu-loongarch64`（用户态）。 |
+| Trace 工具 | `trace` | 纯逻辑，跑得快。 |
+| Softfloat（IEEE 754） | `softfloat` | 纯逻辑，跑得快。 |
+| 软 MMU | `softmmu` | 子串匹配 `softmmu` 和 `softmmu_exec`。 |
+| 多 vCPU 并发回归 | `exec::multi_vcpu` | MTTCG / 多 vCPU 的 exec 测试；跑得久，迭代时配 `-- --nocapture`。 |
+| 源码卫生（禁 `eprintln!` 等） | `source_cleanliness` | 提 PR 前的便宜检查。 |
+| 硬件 oracle（对照参考） | `oracle` | 部分用例对照外部参考值；高并发下偶发抖动，必要时用 `--test-threads=1` 重跑。 |
+
+测试数（顶层模块由 `cargo test -p machina-tests -- --list` 给出，
+随 PR 合入会漂移）可这样实时统计：
+
+```bash
+cargo test -p machina-tests -- --list \
+    | grep ': test$' \
+    | sed 's/::.*//' \
+    | sort | uniq -c | sort -rn
+```
+
+引用任何具体数字时请同时记下统计日期，避免把一次快照当成长期权威。
+
 #### 代码质量检查
 
 ```bash
@@ -824,7 +869,7 @@ cargo fmt                          # 自动格式化
 
 ```bash
 # 多 vCPU 并发回归
-cargo test -p machina-tests exec::mttcg -- --nocapture
+cargo test -p machina-tests exec::multi_vcpu -- --nocapture
 
 # 打印执行统计（TB 命中率、链路 patch、hint 命中）
 TCG_STATS=1 target/release/machina <machine-config>
