@@ -1,0 +1,115 @@
+name: linux-smoke-tests
+
+# Boot a real Linux kernel built by buildroot under machina
+# riscv64-ref and assert userspace reaches a known marker.
+# Resolves gevico/machina#54.
+#
+# Buildroot's full output tree (host toolchain, target sysroot,
+# build intermediates, images) plus the dl/ download cache are
+# saved via actions/cache@v4 keyed on the buildroot version +
+# defconfig + overlay revision. Cache hit -> skip the multi-stage
+# rebuild entirely; cache miss happens once per (version, key)
+# combination.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Buildroot LTS-track quarterly. Bump the patch suffix as
+  # newer point releases land; the cache key encodes the version
+  # so old caches are not reused after a bump.
+  BUILDROOT_VERSION: "2025.11.1"
+  BUILDROOT_DEFCONFIG: qemu_riscv64_virt_defconfig
+
+jobs:
+  linux-smoke:
+    name: linux-smoke (riscv64-ref)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout machina
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build machina (release)
+        run: cargo build --release -p machina-emu
+
+      - name: Install buildroot host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+              build-essential bc bison flex cpio rsync libssl-dev \
+              unzip wget python3 file ca-certificates
+
+      - name: Cache buildroot output
+        id: cache-buildroot
+        uses: actions/cache@v4
+        with:
+          # Cache the *entire* output tree (host toolchain,
+          # target sysroot, build intermediates, images) plus
+          # the download tarball cache. Caching only output/images
+          # forced every run to rebuild the toolchain — the bulk
+          # of buildroot's wall time.
+          path: |
+            buildroot-${{ env.BUILDROOT_VERSION }}/output
+            buildroot-${{ env.BUILDROOT_VERSION }}/dl
+          key: |
+            buildroot-${{ env.BUILDROOT_VERSION }}-${{ env.BUILDROOT_DEFCONFIG }}-machina-overlay-v2
+
+      - name: Build buildroot Linux + initramfs (cache miss)
+        if: steps.cache-buildroot.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          wget -q "https://buildroot.org/downloads/buildroot-${BUILDROOT_VERSION}.tar.gz"
+          tar xf "buildroot-${BUILDROOT_VERSION}.tar.gz"
+          cd "buildroot-${BUILDROOT_VERSION}"
+
+          make "${BUILDROOT_DEFCONFIG}"
+
+          # Auto-poweroff init: when machina's smoke run reaches
+          # this script, it prints the marker that
+          # scripts/run-linux-smoke.sh greps for, then triggers
+          # SBI reset so machina exits cleanly inside the timeout.
+          mkdir -p board/machina-smoke/etc/init.d
+          cat > board/machina-smoke/etc/init.d/S99machina-smoke <<'INIT'
+          #!/bin/sh
+          echo "MACHINA_LINUX_SMOKE_OK"
+          poweroff -f
+          INIT
+          chmod +x board/machina-smoke/etc/init.d/S99machina-smoke
+
+          # qemu_riscv64_virt_defconfig defaults to rootfs.tar; the
+          # Linux -initrd path needs cpio. Enable cpio output and
+          # the rootfs overlay before olddefconfig replays kconfig.
+          {
+              echo 'BR2_TARGET_ROOTFS_CPIO=y'
+              echo "BR2_ROOTFS_OVERLAY=\"$(pwd)/board/machina-smoke\""
+          } >> .config
+          make olddefconfig
+          make -j"$(nproc)"
+
+      - name: Stage buildroot output for the smoke runner
+        run: |
+          mkdir -p buildroot-output
+          cp -r "buildroot-${BUILDROOT_VERSION}/output/images" buildroot-output/
+
+      - name: Run linux-smoke
+        env:
+          BR_IMG: ${{ github.workspace }}/buildroot-output/images
+        run: ./scripts/run-linux-smoke.sh
+
+      - name: Upload smoke log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-smoke-log
+          path: target/linux-smoke/run.log
