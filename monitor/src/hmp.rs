@@ -55,6 +55,7 @@ fn handle_info(arg: &str, svc: &Arc<Mutex<MonitorService>>) -> Option<String> {
                 Some(format!("RAM: {mib} MiB ({bytes} bytes)\n"))
             }
         }
+        "version" => Some(format!("machina {}\n", env!("CARGO_PKG_VERSION"))),
         "status" => {
             let running = s.query_status();
             if running {
@@ -115,6 +116,7 @@ fn handle_info(arg: &str, svc: &Arc<Mutex<MonitorService>>) -> Option<String> {
 
 fn help_text() -> String {
     "\
+info version    -- show machina version\n\
 info status     -- VM run state\n\
 info registers  -- dump GPRs (paused only)\n\
 info cpus       -- list vCPUs\n\
