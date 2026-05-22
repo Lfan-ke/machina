@@ -14,7 +14,7 @@
 # Required inputs:
 #   ${BR_IMG}/Image       — Linux kernel image
 #   ${BR_IMG}/rootfs.cpio — buildroot initramfs whose
-#                            etc/init.d/S99machina-smoke prints
+#                            etc/init.d/S39machina-smoke prints
 #                            "MACHINA_LINUX_SMOKE_OK" then poweroffs
 
 set -euo pipefail
