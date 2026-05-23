@@ -381,6 +381,7 @@ fn parse_args() -> Result<CliArgs, String> {
         }
         i += 1;
     }
+
     Ok(cli)
 }
 
@@ -967,6 +968,40 @@ fn main() {
         eprintln!("machina: loongarch64-ref does not support -monitor");
         machina_hw_core::chardev::restore_terminal();
         process::exit(1);
+    }
+
+    // Issue #50: surface a clear error when riscv64-ref is launched
+    // with no -kernel and no firmware that might supply its own
+    // payload, instead of silently sitting inside the bundled SBI
+    // firmware with nothing to run. The check is intentionally
+    // narrow:
+    //   - Only riscv64-ref hits the bundled-RustSBI hang path; the
+    //     k230 and loongarch64-ref machines have their own boot
+    //     contracts and are validated separately downstream.
+    //   - `-device loader,...` supplies the payload directly into
+    //     RAM (e.g. K230 SDK U-Boot flow), so a loader-driven boot
+    //     is allowed without -kernel.
+    //   - `-bios <ext>` (path other than "none") may be a self-
+    //     contained firmware that drives its own boot, so it is
+    //     also exempt.
+    if cli.machine == "riscv64-ref"
+        && cli.kernel.is_none()
+        && cli.loaders.is_empty()
+    {
+        let bios_external = cli
+            .bios
+            .as_ref()
+            .is_some_and(|p| p.to_str() != Some("none"));
+        if !bios_external {
+            eprintln!(
+                "machina: no kernel specified.\n\
+                 Please use -kernel <path/to/kernel.elf> to provide a guest \
+                 payload.\nWithout -kernel, machina would sit inside SBI \
+                 firmware with nothing to run."
+            );
+            machina_hw_core::chardev::restore_terminal();
+            process::exit(1);
+        }
     }
 
     // Reject -device virtio-net-device without -netdev.
