@@ -266,6 +266,65 @@ fn test_hmp_help_lists_info_memory() {
     assert!(out.as_ref().unwrap().contains("info memory"));
 }
 
+#[test]
+fn test_hmp_info_version() {
+    let svc = make_svc();
+    let out = hmp::handle_line("info version", &svc);
+    let text = out.expect("info version returns output");
+    let expected = format!("machina {}\n", env!("CARGO_PKG_VERSION"));
+    assert_eq!(text, expected);
+}
+
+#[test]
+fn test_hmp_help_lists_info_version() {
+    let svc = make_svc();
+    let out = hmp::handle_line("help", &svc);
+    assert!(out.as_ref().unwrap().contains("info version"));
+}
+
+#[test]
+fn test_mmp_query_version() {
+    let svc = make_svc();
+    let resp = mmp::dispatch("query-version", &svc);
+    // Standard QMP VersionInfo shape: package as a string,
+    // version triple under `qemu` for client compatibility.
+    assert_eq!(resp["return"]["package"], "machina");
+    let qemu = &resp["return"]["qemu"];
+    assert!(qemu["major"].is_number(), "qemu.major must be a number");
+    assert!(qemu["minor"].is_number(), "qemu.minor must be a number");
+    assert!(qemu["micro"].is_number(), "qemu.micro must be a number");
+    // The triple must match CARGO_PKG_VERSION's parsed digits.
+    let parts: Vec<u64> = env!("CARGO_PKG_VERSION")
+        .split('.')
+        .take(3)
+        .map(|s| {
+            s.split(|c: char| !c.is_ascii_digit())
+                .next()
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(0)
+        })
+        .collect();
+    assert_eq!(qemu["major"].as_u64().unwrap(), parts[0]);
+    assert_eq!(qemu["minor"].as_u64().unwrap(), parts[1]);
+    assert_eq!(qemu["micro"].as_u64().unwrap(), parts[2]);
+}
+
+#[test]
+fn test_mmp_greeting_matches_query_version() {
+    // The greeting and query-version must advertise the same
+    // version triple. Both derive from CARGO_PKG_VERSION, so a
+    // single session never exposes conflicting version data.
+    let svc = make_svc();
+    let greeting: serde_json::Value =
+        serde_json::from_str(&mmp::greeting()).unwrap();
+    let greet = &greeting["QMP"]["version"]["machina"];
+    let resp = mmp::dispatch("query-version", &svc);
+    let qemu = &resp["return"]["qemu"];
+    assert_eq!(greet["major"], qemu["major"]);
+    assert_eq!(greet["minor"], qemu["minor"]);
+    assert_eq!(greet["micro"], qemu["micro"]);
+}
+
 // ── TCP socket-level tests ──────────────────────────
 
 fn read_json_line(reader: &mut BufReader<TcpStream>) -> serde_json::Value {
