@@ -63,7 +63,7 @@ jobs:
             buildroot-${{ env.BUILDROOT_VERSION }}/output
             buildroot-${{ env.BUILDROOT_VERSION }}/dl
           key: |
-            buildroot-${{ env.BUILDROOT_VERSION }}-${{ env.BUILDROOT_DEFCONFIG }}-machina-overlay-v2
+            buildroot-${{ env.BUILDROOT_VERSION }}-${{ env.BUILDROOT_DEFCONFIG }}-machina-overlay-v3
 
       - name: Build buildroot Linux + initramfs (cache miss)
         if: steps.cache-buildroot.outputs.cache-hit != 'true'
@@ -76,16 +76,21 @@ jobs:
           make "${BUILDROOT_DEFCONFIG}"
 
           # Auto-poweroff init: when machina's smoke run reaches
-          # this script, it prints the marker that
+          # this script it prints the marker that
           # scripts/run-linux-smoke.sh greps for, then triggers
           # SBI reset so machina exits cleanly inside the timeout.
+          # Numbered S39 so it runs before S40network: riscv64-ref
+          # only exposes a NIC with -netdev, which this run omits,
+          # so the default eth0 bring-up would otherwise block on
+          # "Waiting for interface eth0 to appear" until the run
+          # times out and the marker would never print.
           mkdir -p board/machina-smoke/etc/init.d
-          cat > board/machina-smoke/etc/init.d/S99machina-smoke <<'INIT'
+          cat > board/machina-smoke/etc/init.d/S39machina-smoke <<'INIT'
           #!/bin/sh
           echo "MACHINA_LINUX_SMOKE_OK"
           poweroff -f
           INIT
-          chmod +x board/machina-smoke/etc/init.d/S99machina-smoke
+          chmod +x board/machina-smoke/etc/init.d/S39machina-smoke
 
           # qemu_riscv64_virt_defconfig defaults to rootfs.tar; the
           # Linux -initrd path needs cpio. Enable cpio output and
