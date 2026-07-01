@@ -44,12 +44,17 @@ jobs:
         if: matrix.name == 'msys2'
         uses: msys2/setup-msys2@v2
         with:
-          msystem: MINGW64
+          # UCRT64: MSYS2 dropped the legacy MINGW64 (msvcrt) build of the
+          # riscv64-unknown-elf cross-gcc, so the old
+          # mingw-w64-x86_64-riscv64-unknown-elf-gcc package no longer
+          # resolves. The UCRT64 variant ships the same
+          # riscv64-unknown-elf-gcc used here only as the RISC-V linker.
+          msystem: UCRT64
           update: true
           path-type: inherit
           cache: true
           install: >-
-            mingw-w64-x86_64-riscv64-unknown-elf-gcc
+            mingw-w64-ucrt-x86_64-riscv64-unknown-elf-gcc
 
       # Write cargo config before any cargo commands:
       # - check-revoke = false  avoids CRYPT_E_REVOCATION_OFFLINE errors
